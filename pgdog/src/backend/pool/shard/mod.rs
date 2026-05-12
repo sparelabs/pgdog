@@ -238,13 +238,10 @@ impl Shard {
         self.lb.pools_with_roles_and_bans()
     }
 
-    pub async fn rollback_idle_transactions(&self) {
-        let pools = self.pools();
-        let futures: Vec<_> = pools
-            .iter()
-            .map(|pool| pool.rollback_idle_transactions())
-            .collect();
-        futures::future::join_all(futures).await;
+    pub fn drain(&self) {
+        for pool in &self.pools() {
+            pool.drain();
+        }
     }
 
     /// Shutdown every pool and maintenance task in this shard.

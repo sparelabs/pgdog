@@ -110,9 +110,9 @@ pub fn shutdown() {
     databases().shutdown();
 }
 
-/// Rollback idle in-transaction connections across all pools.
-pub async fn rollback_idle_transactions() {
-    databases().rollback_idle_transactions().await;
+/// Drain all pools: dump idle connections and close any returned from now on.
+pub fn drain() {
+    databases().drain();
 }
 
 /// Cancel all queries running on a database.
@@ -432,13 +432,10 @@ impl Databases {
         Ok(moved)
     }
 
-    async fn rollback_idle_transactions(&self) {
-        let futures: Vec<_> = self
-            .all()
-            .values()
-            .map(|cluster| cluster.rollback_idle_transactions())
-            .collect();
-        futures::future::join_all(futures).await;
+    fn drain(&self) {
+        for cluster in self.all().values() {
+            cluster.drain();
+        }
     }
 
     /// Shutdown all pools.

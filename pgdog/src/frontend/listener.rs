@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::backend::databases::{databases, reload, rollback_idle_transactions, shutdown};
+use crate::backend::databases::{databases, drain, reload, shutdown};
 use crate::config::config;
 use crate::frontend::client::query_engine::two_pc::Manager;
 use crate::net::messages::{hello::SslReply, NegotiateProtocolVersion, Startup};
@@ -106,8 +106,8 @@ impl Listener {
 
         let listener = self.clone();
         spawn(async move {
+            drain();
             listener.execute_shutdown().await;
-            rollback_idle_transactions().await;
             Manager::get().shutdown().await;
             shutdown();
         });

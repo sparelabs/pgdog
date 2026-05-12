@@ -421,15 +421,11 @@ impl Pool {
         self.comms().ready.notify_waiters();
     }
 
-    pub async fn rollback_idle_transactions(&self) {
-        let servers = self.lock().take_idle_in_transaction();
-        let rollback_timeout = self.inner.config.rollback_timeout;
-
-        for mut server in servers {
-            if timeout(rollback_timeout, server.rollback()).await.is_err() {
-                error!("shutdown rollback timed out [{}]", server.addr());
-            }
-        }
+    /// Begin draining: dump idle connections and close any returned from now on.
+    pub fn drain(&self) {
+        let mut guard = self.lock();
+        guard.draining = true;
+        guard.dump_idle();
     }
 
     /// Pool exclusive lock.

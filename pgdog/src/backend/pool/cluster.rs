@@ -643,13 +643,10 @@ impl Cluster {
         }
     }
 
-    pub(crate) async fn rollback_idle_transactions(&self) {
-        let futures: Vec<_> = self
-            .shards()
-            .iter()
-            .map(|shard| shard.rollback_idle_transactions())
-            .collect();
-        futures::future::join_all(futures).await;
+    pub(crate) fn drain(&self) {
+        for shard in self.shards() {
+            shard.drain();
+        }
     }
 
     /// Shutdown the connection pools.
