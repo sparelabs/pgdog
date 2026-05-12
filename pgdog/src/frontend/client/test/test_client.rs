@@ -1,13 +1,11 @@
-use std::{fmt::Debug, ops::Deref, sync::Arc};
+use std::{fmt::Debug, ops::Deref};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use once_cell::sync::Lazy;
 use pgdog_config::RewriteMode;
 use rand::{rng, Rng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::OwnedMutexGuard,
 };
 
 use crate::{
@@ -20,9 +18,6 @@ use crate::{
     },
     net::{BackendKeyData, ErrorResponse, Message, Parameters, Protocol, Stream},
 };
-
-static TEST_ENV_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
-    Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 /// Try to convert a Message to the specified type.
 /// If conversion fails and the message is an ErrorResponse, panic with its contents.
@@ -117,7 +112,6 @@ pub struct TestClient {
     pub(crate) engine: QueryEngine,
     pub(crate) conn: TcpStream,
     pub(crate) leak_pool: bool,
-    _env_lock: Option<OwnedMutexGuard<()>>,
 }
 
 impl TestClient {
@@ -134,17 +128,12 @@ impl TestClient {
             engine: QueryEngine::from_client(&client).expect("create query engine from client"),
             client,
             leak_pool: false,
-            _env_lock: None,
         }
     }
 
     async fn new_with_test_env(params: Parameters, init: impl FnOnce()) -> Self {
-        let env_lock = TEST_ENV_LOCK.clone().lock_owned().await;
         init();
-
-        let mut client = Self::new(params).await;
-        client._env_lock = Some(env_lock);
-        client
+        Self::new(params).await
     }
 
     /// New sharded client with parameters.
@@ -299,12 +288,10 @@ impl Drop for TestClient {
 pub struct SpawnedClient {
     pub conn: TcpStream,
     handle: Option<tokio::task::JoinHandle<()>>,
-    _env_lock: Option<OwnedMutexGuard<()>>,
 }
 
 impl SpawnedClient {
     async fn new(init: impl FnOnce(), params: Parameters) -> Self {
-        let env_lock = TEST_ENV_LOCK.clone().lock_owned().await;
         init();
 
         let (conn, client) = new_client_pair(params).await;
@@ -316,7 +303,6 @@ impl SpawnedClient {
         Self {
             conn,
             handle: Some(handle),
-            _env_lock: Some(env_lock),
         }
     }
 
