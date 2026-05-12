@@ -2248,6 +2248,7 @@ fn create_test_pool_config_resharding_only(host: &str, port: u16) -> PoolConfig 
             user: "pgdog".into(),
             passwords: vec!["pgdog".into()],
             database_name: "pgdog".into(),
+            configured_role: Role::Replica,
             ..Default::default()
         },
         config: Config {
@@ -2639,7 +2640,7 @@ fn test_lag_ban_all_targets_if_banned_safety_valve() {
 
 #[test]
 fn test_lag_ban_replicas_recover_if_banned_primary_excluded_again() {
-    let config = PoolConfig {
+    let primary_config = PoolConfig {
         address: Address {
             host: "127.0.0.1".into(),
             port: 5432,
@@ -2657,7 +2658,26 @@ fn test_lag_ban_replicas_recover_if_banned_primary_excluded_again() {
             },
         },
     };
-    let primary_pool = Pool::new(&config);
+    let primary_pool = Pool::new(&primary_config);
+    let replica_config1 = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
     let replica_config2 = PoolConfig {
         address: Address {
             host: "localhost".into(),
@@ -2665,6 +2685,7 @@ fn test_lag_ban_replicas_recover_if_banned_primary_excluded_again() {
             user: "pgdog".into(),
             passwords: vec!["pgdog".into()],
             database_name: "pgdog".into(),
+            configured_role: Role::Replica,
             ..Default::default()
         },
         config: Config {
@@ -2679,7 +2700,7 @@ fn test_lag_ban_replicas_recover_if_banned_primary_excluded_again() {
 
     let lb = LoadBalancer::new(
         &Some(primary_pool),
-        &[config.clone(), replica_config2],
+        &[replica_config1, replica_config2],
         LoadBalancingStrategy::Random,
         ReadWriteSplit::IncludePrimaryIfReplicaBanned,
     );
@@ -2988,7 +3009,7 @@ fn test_lag_ban_mixed_unhealthy_and_lag() {
 
 #[test]
 fn test_lag_ban_repeated_cycles_converge() {
-    let config = PoolConfig {
+    let primary_config = PoolConfig {
         address: Address {
             host: "127.0.0.1".into(),
             port: 5432,
@@ -3006,7 +3027,26 @@ fn test_lag_ban_repeated_cycles_converge() {
             },
         },
     };
-    let primary_pool = Pool::new(&config);
+    let primary_pool = Pool::new(&primary_config);
+    let replica_config1 = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
     let replica_config2 = PoolConfig {
         address: Address {
             host: "localhost".into(),
@@ -3014,6 +3054,7 @@ fn test_lag_ban_repeated_cycles_converge() {
             user: "pgdog".into(),
             passwords: vec!["pgdog".into()],
             database_name: "pgdog".into(),
+            configured_role: Role::Replica,
             ..Default::default()
         },
         config: Config {
@@ -3028,7 +3069,7 @@ fn test_lag_ban_repeated_cycles_converge() {
 
     let lb = LoadBalancer::new(
         &Some(primary_pool),
-        &[config.clone(), replica_config2],
+        &[replica_config1, replica_config2],
         LoadBalancingStrategy::Random,
         ReadWriteSplit::IncludePrimaryIfReplicaBanned,
     );
