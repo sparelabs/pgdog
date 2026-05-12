@@ -25,5 +25,5 @@ COPY --from=builder /build/target/release/pgdog /usr/local/bin/pgdog
 COPY --from=builder /build/target/release/libpgdog_primary_only_tables.so /usr/lib/libpgdog_primary_only_tables.so
 
 WORKDIR /pgdog
-STOPSIGNAL SIGTERM
+STOPSIGNAL SIGINT
 CMD ["/usr/local/bin/pgdog"]
