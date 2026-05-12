@@ -1,8 +1,10 @@
+use std::ops::Deref;
+
 use pgdog_config::ConfigAndUsers;
 
 use crate::{
     backend::Cluster,
-    config::{config, ReadWriteSplit, ReadWriteStrategy, Role},
+    config::{self, config, ReadWriteSplit, ReadWriteStrategy, Role},
     frontend::{
         client::{Sticky, TransactionType},
         router::{
