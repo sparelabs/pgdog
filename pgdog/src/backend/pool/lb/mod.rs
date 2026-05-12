@@ -28,6 +28,8 @@ use ban::Ban;
 use monitor::*;
 pub use target_health::*;
 
+type Candidates<'a> = Vec<&'a Target>;
+
 #[cfg(test)]
 mod test;
 
@@ -69,7 +71,7 @@ impl Target {
 }
 
 /// Load balancer.
-#[derive(Clone, Default, Debug)]
+#[derive(Debug)]
 pub struct LoadBalancer {
     /// Read/write targets.
     pub(super) targets: Vec<Target>,
@@ -85,6 +87,38 @@ pub struct LoadBalancer {
     pub(super) role_detection: Arc<Notify>,
     /// Read/write split.
     pub(super) rw_split: ReadWriteSplit,
+    /// Cached index of the primary target (`usize::MAX` = none).
+    pub(super) primary_idx: AtomicUsize,
+}
+
+impl Default for LoadBalancer {
+    fn default() -> Self {
+        Self {
+            targets: Vec::new(),
+            checkout_timeout: Duration::ZERO,
+            round_robin: Arc::new(AtomicUsize::new(0)),
+            lb_strategy: LoadBalancingStrategy::default(),
+            maintenance: Arc::new(Notify::new()),
+            role_detection: Arc::new(Notify::new()),
+            rw_split: ReadWriteSplit::default(),
+            primary_idx: AtomicUsize::new(usize::MAX),
+        }
+    }
+}
+
+impl Clone for LoadBalancer {
+    fn clone(&self) -> Self {
+        Self {
+            targets: self.targets.clone(),
+            checkout_timeout: self.checkout_timeout,
+            round_robin: self.round_robin.clone(),
+            lb_strategy: self.lb_strategy,
+            maintenance: self.maintenance.clone(),
+            role_detection: self.role_detection.clone(),
+            rw_split: self.rw_split,
+            primary_idx: AtomicUsize::new(self.primary_idx.load(Ordering::Acquire)),
+        }
+    }
 }
 
 impl LoadBalancer {
@@ -113,6 +147,12 @@ impl LoadBalancer {
             .as_ref()
             .map(|pool| Target::new(pool.clone(), Role::Primary));
 
+        let primary_idx = if primary_target.is_some() {
+            targets.len()
+        } else {
+            usize::MAX
+        };
+
         if let Some(primary) = primary_target {
             targets.push(primary);
         }
@@ -125,6 +165,7 @@ impl LoadBalancer {
             maintenance: Arc::new(Notify::new()),
             role_detection: Arc::new(Notify::new()),
             rw_split,
+            primary_idx: AtomicUsize::new(primary_idx),
         }
     }
 
@@ -137,11 +178,24 @@ impl LoadBalancer {
     ///
     /// Unlike [`primary()`], this returns the full target struct which allows
     /// access to ban and health state for monitoring and testing purposes.
+    ///
+    /// Acquire/Release ordering on `primary_idx` ensures that a store from
+    /// `redetect_roles` is visible before the next `primary_target` read.
     pub fn primary_target(&self) -> Option<&Target> {
-        self.targets
-            .iter()
-            .rev() // If there is a primary, it's likely to be last.
-            .find(|target| target.role() == Role::Primary)
+        let idx = self.primary_idx.load(Ordering::Acquire);
+        if idx == usize::MAX {
+            return None;
+        }
+        if let Some(target) = self.targets.get(idx).filter(|t| t.role() == Role::Primary) {
+            return Some(target);
+        }
+        let found = self.targets.iter().rposition(|t| t.role() == Role::Primary);
+        if let Some(idx) = found {
+            self.primary_idx.store(idx, Ordering::Release);
+            return self.targets.get(idx);
+        }
+        self.primary_idx.store(usize::MAX, Ordering::Release);
+        None
     }
 
     /// Detect database roles from pg_is_in_recovery() and
@@ -190,6 +244,10 @@ impl LoadBalancer {
         if promoted {
             self.role_detection.notify_one();
         }
+
+        let new_idx = self.targets.iter().rposition(|t| t.role() == Role::Primary);
+        self.primary_idx
+            .store(new_idx.unwrap_or(usize::MAX), Ordering::Release);
 
         promoted
     }
@@ -323,23 +381,31 @@ impl LoadBalancer {
             .await
     }
 
-    async fn get_internal(&self, request: &Request) -> Result<Guard, Error> {
-        use LoadBalancingStrategy::*;
+    /// Collect candidate targets for a read query.
+    fn read_candidates(&self) -> Result<Candidates<'_>, Error> {
         use ReadWriteSplit::*;
 
-        let mut candidates: Vec<&Target> = self
-            .targets
-            .iter()
-            .filter(|target| !target.pool.config().resharding_only) // Don't let reads on resharding-only replicas.
-            .collect();
+        let mut candidates: Candidates<'_> = Vec::with_capacity(self.targets.len());
+        let mut total_replicas: u32 = 0;
+        let mut banned_replicas: u32 = 0;
+
+        for target in &self.targets {
+            if target.pool.config().resharding_only {
+                continue;
+            }
+            if target.role() == Role::Replica {
+                total_replicas += 1;
+                if target.ban.banned() {
+                    banned_replicas += 1;
+                }
+            }
+            candidates.push(target);
+        }
 
         let primary_reads = match self.rw_split {
             IncludePrimary => true,
-            IncludePrimaryIfReplicaBanned => candidates.iter().any(|target| target.ban.banned()),
-            // we read from the primary if we have no replicas
-            ExcludePrimary => !candidates
-                .iter()
-                .any(|target| matches!(target.role(), Role::Replica | Role::Auto)),
+            IncludePrimaryIfReplicaBanned | PreferPrimary => total_replicas == banned_replicas,
+            ExcludePrimary => total_replicas == 0,
         };
 
         if !primary_reads {
@@ -350,14 +416,17 @@ impl LoadBalancer {
             return Err(Error::AllReplicasDown);
         }
 
+        Ok(candidates)
+    }
+
+    fn order_candidates(&self, candidates: &mut [&Target]) {
+        use LoadBalancingStrategy::*;
+
         match self.lb_strategy {
             Random => candidates.shuffle(&mut rand::rng()),
             RoundRobin => {
                 let first = self.round_robin.fetch_add(1, Ordering::Relaxed) % candidates.len();
-                let mut reshuffled = vec![];
-                reshuffled.extend_from_slice(&candidates[first..]);
-                reshuffled.extend_from_slice(&candidates[..first]);
-                candidates = reshuffled;
+                candidates.rotate_left(first);
             }
             LeastActiveConnections => {
                 candidates.sort_by_cached_key(|target| target.pool.lock().checked_out());
@@ -369,7 +438,7 @@ impl LoadBalancer {
                     .sum();
 
                 if total_weight > 0 {
-                    for target in &candidates {
+                    for target in candidates.iter() {
                         target
                             .current_weight
                             .fetch_add(target.pool.config().lb_weight as i64, Ordering::Relaxed);
@@ -390,20 +459,24 @@ impl LoadBalancer {
                 }
             }
         }
+    }
 
-        // Only ban a candidate pool if there are more than one
-        // and we have alternates.
+    async fn try_candidates(
+        &self,
+        candidates: &mut [&Target],
+        request: &Request,
+    ) -> Result<Guard, Error> {
+        self.order_candidates(candidates);
+
         let bannable = candidates.len() > 1;
 
-        for target in &candidates {
+        for target in candidates.iter() {
             if target.ban.banned() {
                 continue;
             }
             match target.pool.get(request).await {
                 Ok(conn) => return Ok(conn),
-                Err(Error::Offline) => {
-                    continue;
-                }
+                Err(Error::Offline) => continue,
                 Err(err) => {
                     if bannable {
                         target.ban.ban(err, target.pool.config().ban_timeout);
@@ -415,6 +488,70 @@ impl LoadBalancer {
         candidates.iter().for_each(|target| target.ban.unban(true));
 
         Err(Error::AllReplicasDown)
+    }
+
+    pub(crate) async fn preferred_read(&self, request: &Request) -> Result<Guard, Error> {
+        let primary = self.primary_target();
+        let primary_was_banned = primary.is_none_or(|t| t.ban.banned());
+
+        if let Some(p) = primary.filter(|target| !target.ban.banned()) {
+            match p.pool.get(request).await {
+                Ok(conn) => return Ok(conn),
+                Err(Error::Offline) => {}
+                Err(err) => {
+                    if self.has_replicas() {
+                        p.ban.ban(err, p.pool.config().ban_timeout);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        let mut candidates: Candidates<'_> = self
+            .targets
+            .iter()
+            .filter(|target| target.role() == Role::Replica)
+            .filter(|target| !target.pool.config().resharding_only)
+            .collect();
+
+        if candidates.is_empty() {
+            return if primary.is_some() {
+                Err(Error::PreferredReadUnavailable)
+            } else {
+                Err(Error::AllReplicasDown)
+            };
+        }
+
+        let result = self.try_candidates(&mut candidates, request).await;
+        // Only unban the primary if preferred_read itself banned it. If the
+        // primary was already banned externally (health check, write path),
+        // preserve that ban to avoid masking a legitimate outage.
+        if result.is_err() && !primary_was_banned {
+            if let Some(p) = primary {
+                p.ban.unban(true);
+            }
+        }
+        result
+    }
+
+    pub(crate) async fn any_read(&self, request: &Request) -> Result<Guard, Error> {
+        let mut candidates: Candidates<'_> = self
+            .targets
+            .iter()
+            .filter(|target| !target.pool.config().resharding_only)
+            .collect();
+
+        if candidates.is_empty() {
+            return Err(Error::AllReplicasDown);
+        }
+
+        self.try_candidates(&mut candidates, request).await
+    }
+
+    async fn get_internal(&self, request: &Request) -> Result<Guard, Error> {
+        let mut candidates = self.read_candidates()?;
+        self.try_candidates(&mut candidates, request).await
     }
 
     /// Shutdown replica pools.

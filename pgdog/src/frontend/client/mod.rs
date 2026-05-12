@@ -318,7 +318,7 @@ impl Client {
             timeouts: Timeouts::from_config(&config.config.general),
             client_request: ClientRequest::default(),
             stream_buffer: MessageBuffer::new(config.config.memory.message_buffer),
-            sticky: Sticky::from_params(&params),
+            sticky: Sticky::new(),
             connect_params: params,
         }))
     }
@@ -349,7 +349,7 @@ impl Client {
             timeouts: Timeouts::from_config(&config().config.general),
             client_request: ClientRequest::default(),
             stream_buffer: MessageBuffer::new(4096),
-            sticky: Sticky::from_params(&connect_params),
+            sticky: Sticky::new(),
             params: connect_params,
         }
     }

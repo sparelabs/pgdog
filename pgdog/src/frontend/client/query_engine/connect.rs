@@ -115,7 +115,8 @@ impl QueryEngine {
                 Route::write(ShardWithPriority::new_override_transaction(Shard::Direct(
                     0,
                 )))
-                .with_read(route.is_read()),
+                .with_read(route.is_read())
+                .with_prefer_primary(route.prefer_primary()),
             )
         } else if route.is_search_path_driven() {
             // Schema-based routing will only go to one shard.
@@ -123,7 +124,8 @@ impl QueryEngine {
         } else {
             Ok(
                 Route::write(ShardWithPriority::new_override_transaction(Shard::All))
-                    .with_read(route.is_read()),
+                    .with_read(route.is_read())
+                    .with_prefer_primary(route.prefer_primary()),
             )
         }
     }

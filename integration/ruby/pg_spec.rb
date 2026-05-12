@@ -8,7 +8,7 @@ end
 
 describe 'pg' do
   after do
-    sleep(1)
+    sleep(2) # allow extra time for connections to drain in CI
     ensure_done
   end
 

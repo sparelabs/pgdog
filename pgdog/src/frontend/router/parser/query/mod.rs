@@ -3,9 +3,10 @@ use std::{collections::HashSet, ops::Deref};
 
 use crate::{
     backend::{databases::databases, ShardingSchema},
-    config::Role,
+    config::{ReadWriteSplit, Role},
     frontend::router::{
         context::RouterContext,
+        parameter_hints::RoleHint,
         parser::{OrderBy, Shard},
         round_robin,
         sharding::{Centroids, ContextBuilder},
@@ -41,6 +42,59 @@ use pgdog_plugin::pg_query::{
 use plugins::PluginOutput;
 
 use tracing::{debug, trace};
+
+fn apply_role_hint(route: &mut Route, hint: &RoleHint) {
+    if matches!(hint, RoleHint::Any) {
+        if !route.read_eligible() {
+            trace!("role hint Any ignored: statement is not read-eligible");
+            return;
+        }
+        route.set_read(true);
+        route.set_any_target(true);
+        route.set_prefer_primary(false);
+        return;
+    }
+    if !route.read_eligible() {
+        if hint.is_prefer() {
+            trace!(
+                "role hint {:?} ignored: statement is not read-eligible",
+                hint
+            );
+            return;
+        }
+        debug!("{:?} applied to non-read-eligible statement", hint);
+    }
+    match hint.role() {
+        Role::Replica => route.set_read(true),
+        Role::Primary => route.set_read(false),
+        Role::Auto => unreachable!("RoleHint never maps to Auto"),
+    }
+    route.set_prefer_primary(false);
+}
+
+struct QueryResult {
+    command: Command,
+    comment_role_hint: Option<RoleHint>,
+    role_already_applied: bool,
+}
+
+impl QueryResult {
+    fn new(command: Command) -> Self {
+        Self {
+            command,
+            comment_role_hint: None,
+            role_already_applied: false,
+        }
+    }
+
+    fn with_role_hint(command: Command, comment_role_hint: Option<RoleHint>) -> Self {
+        Self {
+            command,
+            comment_role_hint,
+            role_already_applied: false,
+        }
+    }
+}
 
 /// Query parser.
 ///
@@ -100,12 +154,17 @@ impl QueryParser {
     pub fn parse(&mut self, context: RouterContext) -> Result<Command, Error> {
         let mut context = QueryParserContext::new(context)?;
 
-        let mut command = if context.query().is_ok() {
+        let (mut command, comment_role_hint, role_already_applied) = if context.query().is_ok() {
             self.write_override = context.write_override();
 
-            self.query(&mut context)?
+            let result = self.query(&mut context)?;
+            (
+                result.command,
+                result.comment_role_hint,
+                result.role_already_applied,
+            )
         } else {
-            Command::default()
+            (Command::default(), None, false)
         };
 
         if let Command::Query(route) = &mut command {
@@ -120,10 +179,16 @@ impl QueryParser {
 
             route.set_search_path_driven_mut(context.shards_calculator.is_search_path());
 
-            if let Some(role) = context.router_context.sticky.role {
-                match role {
-                    Role::Primary => route.set_read(false),
-                    _ => route.set_read(true),
+            // Role precedence: comment > transaction/connection param > prefer_primary > parser default.
+            // Role hints only retarget statements that are replica-eligible reads,
+            // unless the hard variant is used (replica / primary bypass read_eligible).
+            if let Some(hint) = &comment_role_hint {
+                apply_role_hint(route, hint);
+            } else if !role_already_applied {
+                if let Some(hint) = context.router_context.parameter_hints.compute_role() {
+                    apply_role_hint(route, &hint);
+                } else if context.rw_split == ReadWriteSplit::PreferPrimary && route.is_read() {
+                    route.set_prefer_primary(true);
                 }
             }
         }
@@ -162,12 +227,15 @@ impl QueryParser {
             Some(Route::write(shard))
 
         // The role is specified in the connection parameter (pgdog.role).
-        } else if let Some(role) = context.router_context.parameter_hints.compute_role() {
-            Some(match role {
+        } else if let Some(hint) = context.router_context.parameter_hints.compute_role() {
+            Some(match hint.role() {
                 Role::Replica => Route::read(shard),
-                Role::Primary | Role::Auto => Route::write(shard),
+                Role::Primary => Route::write(shard),
+                Role::Auto => Route::read(shard).with_any_target(true),
             })
-        // Default to primary.
+        // Without the parser, reads can't be identified, so PreferPrimary has
+        // no effect — all queries go to primary via the write path. Use
+        // `pgdog.role=replica` to explicitly route to replicas.
         } else {
             Some(Route::write(shard))
         }
@@ -183,7 +251,8 @@ impl QueryParser {
     ///
     /// Returns a `Command` if successful, error otherwise.
     ///
-    fn query(&mut self, context: &mut QueryParserContext) -> Result<Command, Error> {
+    fn query(&mut self, context: &mut QueryParserContext) -> Result<QueryResult, Error> {
+        let mut comment_role_hint: Option<RoleHint> = None;
         let use_parser = context.use_parser();
 
         debug!(
@@ -195,7 +264,19 @@ impl QueryParser {
             // Try to figure out where we can send the query without
             // parsing SQL.
             if let Some(route) = Self::query_parser_bypass(context) {
-                return Ok(Command::Query(route));
+                let has_role_hint = context
+                    .router_context
+                    .parameter_hints
+                    .compute_role()
+                    .is_some();
+                // Bypass already resolved the role from the parameter hint
+                // (or defaulted to primary). read_eligible is not checked
+                // because without the parser we don't know the statement type.
+                return Ok(QueryResult {
+                    command: Command::Query(route),
+                    comment_role_hint: None,
+                    role_already_applied: has_role_hint,
+                });
             } else {
                 return Err(Error::QueryParserRequired);
             }
@@ -218,8 +299,9 @@ impl QueryParser {
             }
 
             let role_override = statement.comment_role;
-            if let Some(role) = role_override {
-                self.write_override = role == Role::Primary;
+            if let Some(hint) = role_override {
+                self.write_override = hint.role() == Role::Primary;
+                comment_role_hint = Some(hint);
             }
 
             if statement.comment_shard.is_some() || role_override.is_some() {
@@ -252,7 +334,7 @@ impl QueryParser {
         // Handle multi-statement SET commands (e.g. "SET x TO 1; SET y TO 2").
         if stmts.len() > 1 {
             if let Some(command) = self.try_multi_set(stmts, context)? {
-                return Ok(command);
+                return Ok(QueryResult::new(command));
             }
         }
 
@@ -273,19 +355,23 @@ impl QueryParser {
                     round_robin::next() % context.shards,
                 )));
             // Send empty query to any shard.
-            return Ok(Command::Query(Route::read(
+            return Ok(QueryResult::new(Command::Query(Route::read(
                 context.shards_calculator.shard(),
-            )));
+            ))));
         };
 
         let mut command = match root.node {
             // SET statements -> return immediately.
-            Some(NodeEnum::VariableSetStmt(ref stmt)) => return self.set(stmt, context),
+            Some(NodeEnum::VariableSetStmt(ref stmt)) => {
+                return self.set(stmt, context).map(QueryResult::new)
+            }
             // SHOW statements -> return immediately.
-            Some(NodeEnum::VariableShowStmt(ref stmt)) => return self.show(stmt, context),
+            Some(NodeEnum::VariableShowStmt(ref stmt)) => {
+                return self.show(stmt, context).map(QueryResult::new)
+            }
             // DEALLOCATE statements -> return immediately.
             Some(NodeEnum::DeallocateStmt(_)) => {
-                return Ok(Command::Deallocate);
+                return Ok(QueryResult::new(Command::Deallocate));
             }
             // SELECT statements.
             Some(NodeEnum::SelectStmt(ref stmt)) => self.select(&statement, stmt, context),
@@ -301,7 +387,7 @@ impl QueryParser {
             // e.g. BEGIN, COMMIT, etc.
             Some(NodeEnum::TransactionStmt(ref stmt)) => match self.transaction(stmt, context)? {
                 Command::Query(query) => Ok(Command::Query(query)),
-                command => return Ok(command),
+                command => return Ok(QueryResult::new(command)),
             },
 
             // LISTEN <channel>;
@@ -311,10 +397,10 @@ impl QueryParser {
                     .build()?
                     .apply()?;
 
-                return Ok(Command::Listen {
+                return Ok(QueryResult::new(Command::Listen {
                     shard,
                     channel: stmt.conditionname.clone(),
-                });
+                }));
             }
 
             Some(NodeEnum::NotifyStmt(ref stmt)) => {
@@ -323,23 +409,25 @@ impl QueryParser {
                     .build()?
                     .apply()?;
 
-                return Ok(Command::Notify {
+                return Ok(QueryResult::new(Command::Notify {
                     shard,
                     channel: stmt.conditionname.clone(),
                     payload: stmt.payload.clone(),
-                });
+                }));
             }
 
             Some(NodeEnum::UnlistenStmt(ref stmt)) => {
-                return Ok(Command::Unlisten(stmt.conditionname.clone()));
+                return Ok(QueryResult::new(Command::Unlisten(
+                    stmt.conditionname.clone(),
+                )));
             }
 
             Some(NodeEnum::ExplainStmt(ref stmt)) => self.explain(&statement, stmt, context),
 
             Some(NodeEnum::DiscardStmt { .. }) => {
-                return Ok(Command::Discard {
+                return Ok(QueryResult::new(Command::Discard {
                     extended: !context.query()?.simple(),
-                })
+                }))
             }
 
             _ => self.ddl(&root.node, context),
@@ -357,11 +445,11 @@ impl QueryParser {
 
                     // Since this query isn't executable and we decided
                     // to route it to any shard, we can early return here.
-                    return Ok(Command::Query(
+                    return Ok(QueryResult::new(Command::Query(
                         query
                             .clone()
                             .with_shard(context.shards_calculator.shard().clone()),
-                    ));
+                    )));
                 }
             }
         }
@@ -455,9 +543,12 @@ impl QueryParser {
                     context.sharding_schema.query_parser_engine,
                 )?;
             }
-            Ok(command.dry_run())
+            Ok(QueryResult::with_role_hint(
+                command.dry_run(),
+                comment_role_hint,
+            ))
         } else {
-            Ok(command)
+            Ok(QueryResult::with_role_hint(command, comment_role_hint))
         }
     }
 

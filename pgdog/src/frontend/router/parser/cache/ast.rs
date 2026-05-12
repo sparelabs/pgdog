@@ -11,11 +11,12 @@ use std::sync::Arc;
 use super::super::{Error, Route, Shard, StatementRewrite, StatementRewriteContext, Table};
 use super::{Cache, Fingerprint, Stats};
 use crate::backend::schema::Schema;
+use crate::backend::ShardingSchema;
+use crate::frontend::router::parameter_hints::RoleHint;
 use crate::frontend::router::parser::cache::AstQuery;
 use crate::frontend::router::parser::rewrite::statement::RewritePlan;
 use crate::frontend::PreparedStatements;
 use crate::net::parameter::ParameterValue;
-use crate::{backend::ShardingSchema, config::Role};
 
 /// Abstract syntax tree (query) cache entry,
 /// with statistics.
@@ -26,7 +27,7 @@ pub struct Ast {
     /// Shard.
     pub comment_shard: Option<Shard>,
     /// Role.
-    pub comment_role: Option<Role>,
+    pub comment_role: Option<RoleHint>,
     /// Parser query engine used.
     pub query_parser_engine: QueryParserEngine,
     /// Inner sync.
@@ -190,13 +191,11 @@ impl Ast {
                     }
                 }
 
-                NodeRef::DropStmt(stmt) => {
-                    if stmt.remove_type() == ObjectType::ObjectTable {
-                        for object in &stmt.objects {
-                            if let Some(NodeEnum::List(ref list)) = object.node {
-                                if let Ok(table) = Table::try_from(list) {
-                                    tables.insert(table);
-                                }
+                NodeRef::DropStmt(stmt) if stmt.remove_type() == ObjectType::ObjectTable => {
+                    for object in &stmt.objects {
+                        if let Some(NodeEnum::List(ref list)) = object.node {
+                            if let Ok(table) = Table::try_from(list) {
+                                tables.insert(table);
                             }
                         }
                     }

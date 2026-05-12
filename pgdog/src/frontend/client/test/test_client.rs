@@ -1,11 +1,13 @@
-use std::{fmt::Debug, ops::Deref};
+use std::{fmt::Debug, ops::Deref, sync::Arc};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use once_cell::sync::Lazy;
 use pgdog_config::RewriteMode;
 use rand::{rng, Rng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::OwnedMutexGuard,
 };
 
 use crate::{
@@ -18,6 +20,9 @@ use crate::{
     },
     net::{BackendKeyData, ErrorResponse, Message, Parameters, Protocol, Stream},
 };
+
+static TEST_ENV_LOCK: Lazy<Arc<tokio::sync::Mutex<()>>> =
+    Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 /// Try to convert a Message to the specified type.
 /// If conversion fails and the message is an ErrorResponse, panic with its contents.
@@ -112,6 +117,7 @@ pub struct TestClient {
     pub(crate) engine: QueryEngine,
     pub(crate) conn: TcpStream,
     pub(crate) leak_pool: bool,
+    _env_lock: Option<OwnedMutexGuard<()>>,
 }
 
 impl TestClient {
@@ -128,19 +134,27 @@ impl TestClient {
             engine: QueryEngine::from_client(&client).expect("create query engine from client"),
             client,
             leak_pool: false,
+            _env_lock: None,
         }
+    }
+
+    async fn new_with_test_env(params: Parameters, init: impl FnOnce()) -> Self {
+        let env_lock = TEST_ENV_LOCK.clone().lock_owned().await;
+        init();
+
+        let mut client = Self::new(params).await;
+        client._env_lock = Some(env_lock);
+        client
     }
 
     /// New sharded client with parameters.
     pub(crate) async fn new_sharded(params: Parameters) -> Self {
-        load_test_sharded();
-        Self::new(params).await
+        Self::new_with_test_env(params, load_test_sharded).await
     }
 
     /// New 3-shard client with parameters.
     pub(crate) async fn new_sharded_3(params: Parameters) -> Self {
-        load_test_sharded_3();
-        Self::new(params).await
+        Self::new_with_test_env(params, load_test_sharded_3).await
     }
 
     pub(crate) fn leak_pool(mut self) -> Self {
@@ -150,35 +164,52 @@ impl TestClient {
 
     /// New client with replicas but not sharded.
     pub(crate) async fn new_replicas(params: Parameters) -> Self {
-        load_test_replicas();
-        Self::new(params).await
+        Self::new_with_test_env(params, load_test_replicas).await
+    }
+
+    /// New client with replicas and a custom read/write split.
+    pub(crate) async fn new_replicas_with_read_write_split(
+        params: Parameters,
+        read_write_split: crate::config::ReadWriteSplit,
+    ) -> Self {
+        Self::new_with_test_env(params, move || {
+            load_test_replicas();
+
+            let mut config = config().deref().clone();
+            config.config.general.read_write_split = read_write_split;
+            set(config).unwrap();
+            reload_from_existing().unwrap();
+        })
+        .await
     }
 
     /// New client with cross-shard-queries disabled.
     pub(crate) async fn new_cross_shard_disabled(params: Parameters) -> Self {
-        load_test_sharded();
+        Self::new_with_test_env(params, || {
+            load_test_sharded();
 
-        let mut config = config().deref().clone();
-        config.config.general.cross_shard_disabled = true;
-        set(config).unwrap();
-        reload_from_existing().unwrap();
-
-        Self::new(params).await
+            let mut config = config().deref().clone();
+            config.config.general.cross_shard_disabled = true;
+            set(config).unwrap();
+            reload_from_existing().unwrap();
+        })
+        .await
     }
 
     /// Create client that will rewrite all queries.
     pub(crate) async fn new_rewrites(params: Parameters) -> Self {
-        load_test_sharded();
+        Self::new_with_test_env(params, || {
+            load_test_sharded();
 
-        let mut config = config().deref().clone();
-        config.config.rewrite.enabled = true;
-        config.config.rewrite.shard_key = RewriteMode::Rewrite;
-        config.config.rewrite.split_inserts = RewriteMode::Rewrite;
+            let mut config = config().deref().clone();
+            config.config.rewrite.enabled = true;
+            config.config.rewrite.shard_key = RewriteMode::Rewrite;
+            config.config.rewrite.split_inserts = RewriteMode::Rewrite;
 
-        set(config).unwrap();
-        reload_from_existing().unwrap();
-
-        Self::new(params).await
+            set(config).unwrap();
+            reload_from_existing().unwrap();
+        })
+        .await
     }
 
     /// Send message to client.
@@ -268,10 +299,14 @@ impl Drop for TestClient {
 pub struct SpawnedClient {
     pub conn: TcpStream,
     handle: Option<tokio::task::JoinHandle<()>>,
+    _env_lock: Option<OwnedMutexGuard<()>>,
 }
 
 impl SpawnedClient {
-    async fn new(params: Parameters) -> Self {
+    async fn new(init: impl FnOnce(), params: Parameters) -> Self {
+        let env_lock = TEST_ENV_LOCK.clone().lock_owned().await;
+        init();
+
         let (conn, client) = new_client_pair(params).await;
 
         let handle = tokio::spawn(async move {
@@ -281,17 +316,16 @@ impl SpawnedClient {
         Self {
             conn,
             handle: Some(handle),
+            _env_lock: Some(env_lock),
         }
     }
 
     pub async fn new_default(params: Parameters) -> Self {
-        crate::config::load_test();
-        Self::new(params).await
+        Self::new(crate::config::load_test, params).await
     }
 
     pub async fn new_sharded(params: Parameters) -> Self {
-        load_test_sharded();
-        Self::new(params).await
+        Self::new(load_test_sharded, params).await
     }
 
     pub async fn send(&mut self, message: impl Protocol) {

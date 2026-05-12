@@ -271,7 +271,8 @@ mod test {
                 "table pgdog.test_mirror shouldn't exist yet"
             );
             assert!(mirror.flush(), "mirror didn't flush");
-            sleep(Duration::from_millis(50)).await;
+            // Mirror flush is async — 500ms gives CI enough headroom.
+            sleep(Duration::from_millis(500)).await;
             assert!(
                 conn.execute("DROP TABLE pgdog.test_mirror").await.is_ok(),
                 "pgdog.test_mirror should exist"

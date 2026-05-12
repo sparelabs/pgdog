@@ -131,6 +131,12 @@ func TestShardedTwoPc(t *testing.T) {
 	adminCommand(t, "RELOAD") // Clear stats
 	adminCommand(t, "SET two_phase_commit TO true")
 
+	// SET calls databases::init() which recreates pools from scratch without
+	// migrating connections. Wait for new pools to connect and load schema,
+	// otherwise the first query fails and pgx.Conn marks itself permanently
+	// dead ("conn closed" on every subsequent call).
+	time.Sleep(1 * time.Second)
+
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 0, "pgdog_2pc", "pgdog_sharded", 0, "primary")
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 0, "pgdog_2pc", "pgdog_sharded", 1, "primary")
 
@@ -181,6 +187,12 @@ func TestShardedTwoPcAuto(t *testing.T) {
 	adminCommand(t, "RELOAD") // Clear stats
 	adminCommand(t, "SET two_phase_commit TO true")
 	adminCommand(t, "SET two_phase_commit_auto TO true")
+
+	// SET calls databases::init() which recreates pools from scratch without
+	// migrating connections. Wait for new pools to connect and load schema,
+	// otherwise the first query fails and pgx.Conn marks itself permanently
+	// dead ("conn closed" on every subsequent call).
+	time.Sleep(1 * time.Second)
 
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 0, "pgdog_2pc", "pgdog_sharded", 0, "primary")
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 0, "pgdog_2pc", "pgdog_sharded", 1, "primary")

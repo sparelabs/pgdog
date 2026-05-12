@@ -78,6 +78,9 @@ impl From<Vec<usize>> for Shard {
 pub struct Route {
     shard: ShardWithPriority,
     read: bool,
+    read_eligible: bool,
+    prefer_primary: bool,
+    any_target: bool,
     order_by: Vec<OrderBy>,
     aggregate: Aggregate,
     limit: Limit,
@@ -98,13 +101,25 @@ impl Display for Route {
             f,
             "shard={}, role={}",
             self.shard.deref(),
-            if self.read { "replica" } else { "primary" }
+            if self.any_target {
+                "read(any_target)"
+            } else if self.prefer_primary {
+                "read(prefer_primary)"
+            } else if self.read {
+                "replica"
+            } else {
+                "primary"
+            }
         )
     }
 }
 
 impl Route {
     /// Create new route for a `SELECT` query.
+    ///
+    /// `read_eligible` defaults to `false` -- callers must set it via
+    /// `set_read_eligible()` after evaluating CTE writes, locking, and
+    /// function side-effects.
     pub fn select(
         shard: ShardWithPriority,
         order_by: Vec<OrderBy>,
@@ -128,6 +143,7 @@ impl Route {
         Self {
             shard,
             read: true,
+            read_eligible: true,
             ..Default::default()
         }
     }
@@ -150,6 +166,10 @@ impl Route {
     /// to a primary.
     pub fn is_write(&self) -> bool {
         !self.is_read()
+    }
+
+    pub fn read_eligible(&self) -> bool {
+        self.read_eligible
     }
 
     /// Get shard if any.
@@ -250,6 +270,40 @@ impl Route {
 
     pub fn set_read(&mut self, read: bool) {
         self.read = read;
+        if !read {
+            self.prefer_primary = false;
+            self.any_target = false;
+        }
+    }
+
+    pub fn set_read_eligible(&mut self, read_eligible: bool) {
+        self.read_eligible = read_eligible;
+    }
+
+    pub fn prefer_primary(&self) -> bool {
+        self.prefer_primary
+    }
+
+    pub fn set_prefer_primary(&mut self, prefer_primary: bool) {
+        self.prefer_primary = prefer_primary && self.read;
+    }
+
+    pub fn with_prefer_primary(mut self, prefer_primary: bool) -> Self {
+        self.set_prefer_primary(prefer_primary);
+        self
+    }
+
+    pub fn any_target(&self) -> bool {
+        self.any_target
+    }
+
+    pub fn set_any_target(&mut self, any_target: bool) {
+        self.any_target = any_target && self.read;
+    }
+
+    pub fn with_any_target(mut self, any_target: bool) -> Self {
+        self.set_any_target(any_target);
+        self
     }
 
     pub fn explain(&self) -> Option<&ExplainTrace> {
@@ -701,6 +755,82 @@ mod test {
             None,
         );
         assert!(!route.should_buffer());
+    }
+
+    #[test]
+    fn test_set_read_false_clears_prefer_primary() {
+        let mut route = Route::read(ShardWithPriority::default());
+        route.set_prefer_primary(true);
+        assert!(route.prefer_primary());
+
+        route.set_read(false);
+        assert!(!route.prefer_primary());
+    }
+
+    #[test]
+    fn test_set_prefer_primary_on_write_is_noop() {
+        let mut route = Route::write(ShardWithPriority::default());
+        route.set_prefer_primary(true);
+        assert!(!route.prefer_primary());
+    }
+
+    #[test]
+    fn test_with_prefer_primary_builder() {
+        let route = Route::read(ShardWithPriority::default()).with_prefer_primary(true);
+        assert!(route.prefer_primary());
+
+        let route = Route::write(ShardWithPriority::default()).with_prefer_primary(true);
+        assert!(!route.prefer_primary());
+    }
+
+    #[test]
+    fn test_read_route_defaults_read_eligible() {
+        let route = Route::read(ShardWithPriority::default());
+        assert!(route.read_eligible());
+    }
+
+    #[test]
+    fn test_write_route_defaults_not_read_eligible() {
+        let route = Route::write(ShardWithPriority::default());
+        assert!(!route.read_eligible());
+    }
+
+    #[test]
+    fn test_select_route_defaults_not_read_eligible() {
+        let route = Route::select(
+            ShardWithPriority::default(),
+            vec![],
+            Default::default(),
+            Limit::default(),
+            None,
+        );
+        assert!(!route.read_eligible());
+    }
+
+    #[test]
+    fn test_set_any_target_on_write_is_noop() {
+        let mut route = Route::write(ShardWithPriority::default());
+        route.set_any_target(true);
+        assert!(!route.any_target());
+    }
+
+    #[test]
+    fn test_set_read_false_clears_any_target() {
+        let mut route = Route::read(ShardWithPriority::default());
+        route.set_any_target(true);
+        assert!(route.any_target());
+
+        route.set_read(false);
+        assert!(!route.any_target());
+    }
+
+    #[test]
+    fn test_with_any_target_builder() {
+        let route = Route::read(ShardWithPriority::default()).with_any_target(true);
+        assert!(route.any_target());
+
+        let route = Route::write(ShardWithPriority::default()).with_any_target(true);
+        assert!(!route.any_target());
     }
 
     #[test]

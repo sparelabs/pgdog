@@ -87,6 +87,16 @@ impl Shard {
         }
     }
 
+    /// Get a read connection, preferring the primary and falling back to replicas.
+    pub async fn preferred_read(&self, request: &Request) -> Result<Guard, Error> {
+        self.lb.preferred_read(request).await
+    }
+
+    /// Get a read connection from any target (primary or replica), ignoring rw_split.
+    pub async fn any_read(&self, request: &Request) -> Result<Guard, Error> {
+        self.lb.any_read(request).await
+    }
+
     /// Move connections from this shard to another shard, preserving them.
     ///
     /// This is done during configuration reloading, if no significant changes are made to
@@ -263,6 +273,11 @@ impl Shard {
         self.lb.params(request).await
     }
 
+    /// Read/write split mode configured for this shard.
+    pub fn rw_split(&self) -> ReadWriteSplit {
+        self.lb.rw_split
+    }
+
     /// (Re)initialize the pub/sub listener.
     pub(crate) fn init_pub_sub(&self) {
         if self.inner.pub_sub_enabled {
@@ -434,5 +449,52 @@ mod test {
         shard.shutdown();
 
         assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_primary_ban_does_not_block_writes() {
+        crate::logger();
+
+        let primary = &Some(PoolConfig {
+            address: Address::new_test(),
+            config: crate::backend::pool::Config {
+                inner: pgdog_stats::Config {
+                    checkout_timeout: Duration::from_millis(100),
+                    ..Default::default()
+                },
+            },
+        });
+
+        let replicas = &[];
+
+        let shard = Shard::new(ShardConfig {
+            number: 0,
+            primary,
+            replicas,
+            lb_strategy: LoadBalancingStrategy::Random,
+            rw_split: ReadWriteSplit::ExcludePrimary,
+            identifier: Arc::new(User {
+                user: "pgdog".into(),
+                database: "pgdog".into(),
+            }),
+            lsn_check_interval: Duration::MAX,
+            pub_sub_enabled: false,
+        });
+        shard.launch();
+
+        shard
+            .lb
+            .primary_target()
+            .unwrap()
+            .ban
+            .ban(Error::ServerError, Duration::from_secs(60));
+
+        let result = shard.primary(&Request::default()).await;
+        assert!(
+            !matches!(result, Err(Error::Banned)),
+            "writes must not be blocked by a primary ban",
+        );
+
+        shard.shutdown();
     }
 }

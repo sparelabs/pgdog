@@ -167,14 +167,14 @@ fn test_reset() {
 #[test]
 fn test_set_single_primary() {
     let mut test = QueryParserTest::new_single_primary(&config());
-    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()].into());
+    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()]);
     assert!(matches!(command, Command::Set { .. }));
 
     let mut config = (*config()).clone();
     config.config.general.query_parser = pgdog_config::QueryParserLevel::Off;
 
     let mut test = QueryParserTest::new_single_primary(&config);
-    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()].into());
+    let command = test.execute(vec![Query::new("SET statement_timeout TO 1").into()]);
     match command {
         Command::Query(query) => assert_eq!(
             query.shard_with_priority().source(),

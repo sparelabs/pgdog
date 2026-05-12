@@ -309,10 +309,22 @@ mod test {
 
     #[test]
     fn test_node_id_error() {
+        // node_id() splits instance_id() on "-" and parses the last segment.
+        // When NODE_ID is unset, instance_id() is 8 random hex chars (no "-"),
+        // so the whole string is parsed — which fails unless it happens to be
+        // all-decimal digits.  However, INSTANCE_ID is a Lazy static: if
+        // test_node_id_set ran first (same process), it's already "pgdog-1"
+        // and node_id() would return Ok(1).  Guard against that by checking
+        // the current instance_id value directly.
         unsafe {
             remove_var("NODE_ID");
         }
-        assert!(node_id().is_err());
+        let id = instance_id();
+        if !id.contains('-') {
+            // Random hex id — parse should fail (hex is not valid decimal).
+            assert!(node_id().is_err());
+        }
+        // If id contains '-' it was set by another test via NODE_ID; skip.
     }
 
     #[test]

@@ -1,10 +1,13 @@
 use crate::{
     backend::databases::databases,
+    backend::pool::Error as PoolError,
+    config::ReadWriteSplit,
     config::Role,
     net::{Parameters, ToBytes},
 };
 
 use super::prelude::*;
+use std::time::Duration;
 
 /// Test that queries are distributed across primary and replica via round-robin,
 /// and that pool stats are tracked correctly.
@@ -96,4 +99,100 @@ async fn test_round_robin_with_replicas() {
 
     assert!(pool_sent <= len_sent as isize);
     assert!(pool_recv <= len_recv as isize);
+}
+
+#[tokio::test]
+async fn test_prefer_primary_reads_use_primary_by_default() {
+    let mut client = TestClient::new_replicas_with_read_write_split(
+        Parameters::default(),
+        ReadWriteSplit::PreferPrimary,
+    )
+    .await;
+
+    let before = assignment_counts();
+
+    client.send_simple(Query::new("SELECT 1")).await;
+    client.read_until('Z').await.unwrap();
+
+    let after = assignment_counts();
+    assert_eq!(after.0 - before.0, 1);
+    assert_eq!(after.1 - before.1, 0);
+}
+
+#[tokio::test]
+async fn test_prefer_primary_reads_use_primary_when_replicas_are_banned() {
+    let mut client = TestClient::new_replicas_with_read_write_split(
+        Parameters::default(),
+        ReadWriteSplit::PreferPrimary,
+    )
+    .await;
+
+    for (role, ban, _) in
+        databases().cluster(("pgdog", "pgdog")).unwrap().shards()[0].pools_with_roles_and_bans()
+    {
+        if role == Role::Replica {
+            ban.ban(PoolError::ServerError, Duration::from_secs(60));
+        }
+    }
+
+    let before = assignment_counts();
+
+    client.send_simple(Query::new("SELECT 1")).await;
+    client.read_until('Z').await.unwrap();
+
+    let after = assignment_counts();
+    assert_eq!(after.0 - before.0, 1);
+    assert_eq!(after.1 - before.1, 0);
+}
+
+#[tokio::test]
+async fn test_prefer_primary_reads_fail_over_to_replica_when_primary_is_banned() {
+    let mut client = TestClient::new_replicas_with_read_write_split(
+        Parameters::default(),
+        ReadWriteSplit::PreferPrimary,
+    )
+    .await;
+
+    for (role, ban, _) in
+        databases().cluster(("pgdog", "pgdog")).unwrap().shards()[0].pools_with_roles_and_bans()
+    {
+        if role == Role::Primary {
+            ban.ban(PoolError::ServerError, Duration::from_secs(60));
+        }
+    }
+
+    let before = assignment_counts();
+
+    client.send_simple(Query::new("SELECT 1")).await;
+    client.read_until('Z').await.unwrap();
+
+    let after = assignment_counts();
+    assert_eq!(after.0 - before.0, 0);
+    assert_eq!(after.1 - before.1, 1);
+}
+
+#[tokio::test]
+async fn test_prefer_primary_override_replica_all_replicas_banned_falls_back_to_primary() {
+    let mut params = Parameters::default();
+    params.insert("pgdog.role", "replica");
+
+    let mut client =
+        TestClient::new_replicas_with_read_write_split(params, ReadWriteSplit::PreferPrimary).await;
+
+    for (role, ban, _) in
+        databases().cluster(("pgdog", "pgdog")).unwrap().shards()[0].pools_with_roles_and_bans()
+    {
+        if role == Role::Replica {
+            ban.ban(PoolError::ServerError, Duration::from_secs(60));
+        }
+    }
+
+    let before = assignment_counts();
+
+    client.send_simple(Query::new("SELECT 1")).await;
+    client.read_until('Z').await.unwrap();
+
+    let after = assignment_counts();
+    assert_eq!(after.0 - before.0, 1);
+    assert_eq!(after.1 - before.1, 0);
 }

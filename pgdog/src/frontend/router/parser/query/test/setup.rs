@@ -1,10 +1,8 @@
-use std::ops::Deref;
-
 use pgdog_config::ConfigAndUsers;
 
 use crate::{
     backend::Cluster,
-    config::{self, config, ReadWriteStrategy},
+    config::{config, ReadWriteSplit, ReadWriteStrategy, Role},
     frontend::{
         client::{Sticky, TransactionType},
         router::{
@@ -97,14 +95,54 @@ impl QueryParserTest {
         self
     }
 
+    /// Set the read/write split on the cluster.
+    pub(crate) fn with_read_write_split(mut self, split: ReadWriteSplit) -> Self {
+        self.cluster.set_read_write_split(split);
+        self
+    }
+
     /// Enable dry run mode for this test.
     pub(crate) fn with_dry_run(mut self) -> Self {
-        let mut updated = config().deref().clone();
-        updated.config.general.dry_run = true;
-        config::set(updated).unwrap();
-        // Recreate cluster with the new config
-        self.cluster = Cluster::new_test(&config());
+        self.cluster.set_dry_run(true);
         self
+    }
+
+    /// Set the connection role (simulates `SET pgdog.role` with soft/prefer hint).
+    pub(crate) fn with_connection_role(mut self, role: Role) -> Self {
+        let value = match role {
+            Role::Primary => "prefer-primary",
+            Role::Replica => "prefer-replica",
+            Role::Auto => "auto",
+        };
+        self.params.insert("pgdog.role", value);
+        self
+    }
+
+    /// Set a hard connection role (simulates `SET pgdog.role TO 'replica'`).
+    pub(crate) fn with_force_connection_role(mut self, role: Role) -> Self {
+        let value = match role {
+            Role::Primary => "primary",
+            Role::Replica => "replica",
+            Role::Auto => "auto",
+        };
+        self.params.insert("pgdog.role", value);
+        self
+    }
+
+    /// Set the transaction-local role (simulates `SET LOCAL pgdog.role`).
+    pub(crate) fn with_transaction_role(mut self, role: Role) -> Self {
+        let value = match role {
+            Role::Primary => "prefer-primary",
+            Role::Replica => "prefer-replica",
+            Role::Auto => "auto",
+        };
+        self.params.insert_transaction("pgdog.role", value, true);
+        self
+    }
+
+    /// Clear the connection role (simulates `RESET pgdog.role`).
+    pub(crate) fn clear_connection_role(&mut self) {
+        self.params.reset("pgdog.role");
     }
 
     /// Set a parameter value.

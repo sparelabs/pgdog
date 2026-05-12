@@ -138,6 +138,7 @@ func TestRoundRobinWithPrimary(t *testing.T) {
 	adminCommand(t, "RELOAD")
 	adminCommand(t, "SET load_balancing_strategy TO 'round_robin'")
 	pool := getPool(t)
+	defer pool.Close()
 
 	migrate(t, pool)
 

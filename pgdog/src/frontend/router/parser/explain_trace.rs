@@ -1,5 +1,4 @@
-use pgdog_config::Role;
-
+use crate::frontend::router::parameter_hints::RoleHint;
 use crate::frontend::router::parser::route::Shard;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -98,15 +97,16 @@ impl ExplainRecorder {
         self.plugin = None;
     }
 
-    pub fn record_comment_override(&mut self, shard: Shard, role: Option<Role>) {
+    pub fn record_comment_override(&mut self, shard: Shard, role: Option<RoleHint>) {
         let mut description = match shard {
             Shard::Direct(_) | Shard::Multi(_) | Shard::All => {
                 format!("manual override to shard={}", shard)
             }
         };
 
-        if let Some(role) = role {
-            description.push_str(&format!(" role={}", role));
+        if let Some(hint) = role {
+            let prefix = if hint.is_prefer() { "prefer-" } else { "" };
+            description.push_str(&format!(" role={}{}", prefix, hint.role()));
         }
 
         self.comment = Some(ExplainEntry::new(Some(shard), description));
@@ -184,7 +184,7 @@ mod tests {
     fn finalize_inserts_comment_and_plugin_entries() {
         let mut recorder = ExplainRecorder::new();
         recorder.record_entry(Some(Shard::Direct(7)), "matched sharding key");
-        recorder.record_comment_override(Shard::Direct(3), Some(Role::Primary));
+        recorder.record_comment_override(Shard::Direct(3), Some(RoleHint::PreferPrimary));
         recorder.record_plugin_override("test_plugin", Some(Shard::Direct(9)), Some(true));
 
         let trace = recorder.finalize(ExplainSummary {
@@ -198,7 +198,10 @@ mod tests {
             .map(|entry| entry.description.as_str())
             .collect();
 
-        assert_eq!(descriptions[0], "manual override to shard=3 role=primary");
+        assert_eq!(
+            descriptions[0],
+            "manual override to shard=3 role=prefer-primary"
+        );
         assert_eq!(descriptions[1], "matched sharding key");
         assert_eq!(
             descriptions[2],

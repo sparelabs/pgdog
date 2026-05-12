@@ -454,9 +454,9 @@ fn test_set() {
         context.read_only = read_only;
         // Overriding context above.
         let mut qp = QueryParser::default();
-        let route = qp.query(&mut context).unwrap();
+        let result = qp.query(&mut context).unwrap();
 
-        match route {
+        match result.command {
             Command::Set { .. } => {}
             _ => panic!("set must be intercepted"),
         }
@@ -589,10 +589,36 @@ WHERE t2.account = (
     let router_context =
         RouterContext::new(&buffer, &cluster, &params, transaction, Sticky::new()).unwrap();
     let mut context = QueryParserContext::new(router_context).unwrap();
-    let route = qp.query(&mut context).unwrap();
-    match route {
+    let result = qp.query(&mut context).unwrap();
+    match result.command {
         Command::Query(query) => assert!(query.is_write()),
         _ => panic!("not a select"),
+    }
+}
+
+#[test]
+fn test_comment() {
+    let query = "/* pgdog_role: prefer-primary */ SELECT 1";
+    let route = query!(query);
+    assert!(route.is_write());
+
+    let query = "/* pgdog_shard: 1234 */ SELECT 1234";
+    let route = query!(query);
+    assert_eq!(route.shard(), &Shard::Direct(1234));
+
+    // Comment is ignored.
+    let command = query_parser!(
+        QueryParser::default(),
+        Parse::named(
+            "test",
+            "/* pgdog_shard: 1234 */ SELECT * FROM sharded WHERE id = $1"
+        ),
+        false
+    );
+
+    match command {
+        Command::Query(query) => assert_eq!(query.shard(), &Shard::Direct(1234)),
+        _ => panic!("not a query"),
     }
 }
 

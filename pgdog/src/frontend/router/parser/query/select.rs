@@ -23,6 +23,7 @@ impl QueryParser {
         let cte_writes = Self::cte_writes(stmt);
         let has_locking = Self::has_locking_clause(stmt);
         let mut overrides = Self::functions(stmt)?;
+        let read_eligible = !cte_writes && !has_locking && !overrides.writes;
 
         // Write overwrite because of conservative read/write split.
         if self.write_override {
@@ -48,11 +49,11 @@ impl QueryParser {
                 None,
             )
             .extract_advisory_locks();
-            return Ok(Command::Query(
-                Route::read(context.shards_calculator.shard().clone())
-                    .with_functions(overrides)
-                    .with_advisory_locks(advisory_locks),
-            ));
+            let mut query = Route::read(context.shards_calculator.shard().clone())
+                .with_functions(overrides)
+                .with_advisory_locks(advisory_locks);
+            query.set_read_eligible(read_eligible);
+            return Ok(Command::Query(query));
         }
 
         let mut shards = HashSet::new();
@@ -103,11 +104,11 @@ impl QueryParser {
                 .shards_calculator
                 .push(ShardWithPriority::new_rr_no_table(shard));
 
-            return Ok(Command::Query(
-                Route::read(context.shards_calculator.shard().clone())
-                    .with_functions(overrides)
-                    .with_advisory_locks(advisory_locks),
-            ));
+            let mut query = Route::read(context.shards_calculator.shard().clone())
+                .with_functions(overrides)
+                .with_advisory_locks(advisory_locks);
+            query.set_read_eligible(read_eligible);
+            return Ok(Command::Query(query));
         }
 
         let order_by = Self::select_sort(&stmt.sort_clause, context.router_context.bind);
@@ -223,6 +224,8 @@ impl QueryParser {
         if query.is_cross_shard() && context.shards > 1 {
             query.with_aggregate_rewrite_plan_mut(cached_ast.rewrite_plan.aggregates.clone());
         }
+
+        query.set_read_eligible(read_eligible);
 
         Ok(Command::Query(
             query

@@ -97,6 +97,11 @@ impl Connection {
                     self.safe_reload().await?;
                     return self.try_conn(request, route).await;
                 }
+                Err(Error::Pool(super::Error::PreferredReadUnavailable)) => {
+                    debug!("preferred read unavailable, reloading cluster");
+                    self.reload()?;
+                    return self.try_conn(request, route).await;
+                }
                 Err(err) => {
                     return Err(err);
                 }
@@ -135,7 +140,13 @@ impl Connection {
     async fn try_conn(&mut self, request: &Request, route: &Route) -> Result<(), Error> {
         if let Shard::Direct(shard) = route.shard() {
             let mut server = if route.is_read() {
-                self.cluster()?.replica(*shard, request).await?
+                if route.any_target() {
+                    self.cluster()?.any_read(*shard, request).await?
+                } else if route.prefer_primary() {
+                    self.cluster()?.preferred_read(*shard, request).await?
+                } else {
+                    self.cluster()?.replica(*shard, request).await?
+                }
             } else {
                 self.cluster()?.primary(*shard, request).await?
             };
@@ -167,7 +178,13 @@ impl Connection {
                     }
                 };
                 let mut server = if route.is_read() {
-                    shard.replica(request).await?
+                    if route.any_target() {
+                        shard.any_read(request).await?
+                    } else if route.prefer_primary() {
+                        shard.preferred_read(request).await?
+                    } else {
+                        shard.replica(request).await?
+                    }
                 } else {
                     shard.primary(request).await?
                 };
