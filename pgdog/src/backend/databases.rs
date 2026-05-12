@@ -60,17 +60,18 @@ pub fn replace_databases(new_databases: Databases, reload: bool) -> Result<(), E
     let old_databases = databases();
     let new_databases = Arc::new(new_databases);
 
-    // 2. Launch new databases.
-    new_databases.launch();
-
-    // 3. Swap DATABASES to point to new pools before marking old ones offline.
+    // 2. Swap DATABASES to point to new pools before marking old ones offline.
     //    This way any client retry via safe_reload() immediately gets new pools.
     DATABASES.store(Arc::clone(&new_databases));
 
-    // 4. Move connections from old databases into new ones.
+    // 3. Move connections from old databases into new ones.
     if reload {
         old_databases.move_conns_to(&new_databases)?;
     }
+
+    // 4. Launch new databases after move so maintenance sees transferred connections
+    //    and doesn't create duplicates.
+    new_databases.launch();
 
     // 5. Shutdown old databases.
     old_databases.shutdown();
