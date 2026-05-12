@@ -296,6 +296,25 @@ impl LoadBalancer {
             *to.pool.inner().lsn_stats.write() = from.pool.lsn_stats();
         }
 
+        // Update the destination's primary_idx cache so that primary_target()
+        // can find the primary without waiting for the role detector to run.
+        // Without this, auto-role clusters briefly appear to have no primary
+        // after a RELOAD, causing writes to fail with "no primary" or get
+        // misrouted to replicas.
+        let new_idx = destination
+            .targets
+            .iter()
+            .rposition(|t| t.role() == Role::Primary);
+        destination
+            .primary_idx
+            .store(new_idx.unwrap_or(usize::MAX), Ordering::Release);
+
+        // If roles are fully resolved (no Auto targets left), wake any
+        // waiters blocked in wait_roles_detected() on the new LB.
+        if new_idx.is_some() && destination.roles_detected() {
+            destination.role_detection.notify_one();
+        }
+
         Ok(())
     }
 
