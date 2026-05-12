@@ -8,6 +8,7 @@ COPY .git /build/.git
 WORKDIR /build
 
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
 RUN source ~/.cargo/env && \
     if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then \
         export RUSTFLAGS="-Ctarget-feature=+lse"; \
@@ -24,5 +25,5 @@ COPY --from=builder /build/target/release/pgdog /usr/local/bin/pgdog
 COPY --from=builder /build/target/release/libpgdog_primary_only_tables.so /usr/lib/libpgdog_primary_only_tables.so
 
 WORKDIR /pgdog
-STOPSIGNAL SIGINT
+STOPSIGNAL SIGTERM
 CMD ["/usr/local/bin/pgdog"]
