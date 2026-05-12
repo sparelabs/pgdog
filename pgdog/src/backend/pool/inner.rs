@@ -414,6 +414,20 @@ impl Inner {
         }
     }
 
+    #[allow(clippy::vec_box)]
+    pub(super) fn take_idle_in_transaction(&mut self) -> Vec<Box<Server>> {
+        let mut in_txn = Vec::new();
+        let mut i = 0;
+        while i < self.idle_connections.len() {
+            if self.idle_connections[i].in_transaction() {
+                in_txn.push(self.idle_connections.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        in_txn
+    }
+
     #[inline]
     pub(super) fn close_waiters(&mut self, err: Error) {
         for waiter in self.waiting.drain(..) {
@@ -1180,5 +1194,69 @@ mod test {
         let idle_ids: Vec<_> = inner.idle_conns().iter().map(|s| *s.id()).collect();
         assert!(idle_ids.contains(&server1_id));
         assert!(idle_ids.contains(&server2_id));
+    }
+
+    #[test]
+    fn test_take_idle_in_transaction() {
+        let mut inner = Inner::default();
+
+        let clean1 = Box::new(Server::default());
+        let clean1_id = *clean1.id();
+        let txn1 = Box::new(Server::new_in_transaction());
+        let txn1_id = *txn1.id();
+        let clean2 = Box::new(Server::default());
+        let clean2_id = *clean2.id();
+        let txn2 = Box::new(Server::new_in_transaction());
+        let txn2_id = *txn2.id();
+
+        inner.idle_connections.push(clean1);
+        inner.idle_connections.push(txn1);
+        inner.idle_connections.push(clean2);
+        inner.idle_connections.push(txn2);
+
+        assert_eq!(inner.idle(), 4);
+
+        let in_txn = inner.take_idle_in_transaction();
+
+        assert_eq!(in_txn.len(), 2);
+        assert_eq!(inner.idle(), 2);
+
+        let txn_ids: Vec<_> = in_txn.iter().map(|s| *s.id()).collect();
+        assert!(txn_ids.contains(&txn1_id));
+        assert!(txn_ids.contains(&txn2_id));
+
+        let idle_ids: Vec<_> = inner.idle_conns().iter().map(|s| *s.id()).collect();
+        assert!(idle_ids.contains(&clean1_id));
+        assert!(idle_ids.contains(&clean2_id));
+    }
+
+    #[test]
+    fn test_take_idle_in_transaction_none() {
+        let mut inner = Inner::default();
+
+        inner.idle_connections.push(Box::new(Server::default()));
+        inner.idle_connections.push(Box::new(Server::default()));
+
+        let in_txn = inner.take_idle_in_transaction();
+
+        assert!(in_txn.is_empty());
+        assert_eq!(inner.idle(), 2);
+    }
+
+    #[test]
+    fn test_take_idle_in_transaction_all() {
+        let mut inner = Inner::default();
+
+        inner
+            .idle_connections
+            .push(Box::new(Server::new_in_transaction()));
+        inner
+            .idle_connections
+            .push(Box::new(Server::new_in_transaction()));
+
+        let in_txn = inner.take_idle_in_transaction();
+
+        assert_eq!(in_txn.len(), 2);
+        assert_eq!(inner.idle(), 0);
     }
 }

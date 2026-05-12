@@ -1243,6 +1243,13 @@ pub mod test {
 
             server
         }
+
+        pub fn new_in_transaction() -> Server {
+            let mut server = Server::default();
+            server.in_transaction = true;
+
+            server
+        }
     }
 
     pub async fn test_server() -> Server {

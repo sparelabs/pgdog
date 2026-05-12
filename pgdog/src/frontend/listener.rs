@@ -4,13 +4,14 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::backend::databases::{databases, reload, shutdown};
+use crate::backend::databases::{databases, reload, rollback_idle_transactions, shutdown};
 use crate::config::config;
 use crate::frontend::client::query_engine::two_pc::Manager;
 use crate::net::messages::{hello::SslReply, NegotiateProtocolVersion, Startup};
 use crate::net::{self, tls::acceptor};
 use crate::net::{tweak, Stream};
 use crate::sighup::Sighup;
+use crate::sigterm::Sigterm;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::ctrl_c;
 use tokio::sync::Notify;
@@ -43,6 +44,7 @@ impl Listener {
         let listener = TcpListener::bind(&self.addr).await?;
         let shutdown_signal = comms().shutting_down();
         let mut sighup = Sighup::new()?;
+        let mut sigterm = Sigterm::new()?;
 
         loop {
             select! {
@@ -75,6 +77,10 @@ impl Listener {
                     self.start_shutdown();
                 }
 
+                _ = sigterm.listen() => {
+                    self.start_shutdown();
+                }
+
                 _ = sighup.listen() => {
                     if let Err(err) = reload() {
                         error!("configuration reload error: {}", err);
@@ -101,7 +107,8 @@ impl Listener {
         let listener = self.clone();
         spawn(async move {
             listener.execute_shutdown().await;
-            Manager::get().shutdown().await; // wait for 2pc to flush
+            rollback_idle_transactions().await;
+            Manager::get().shutdown().await;
             shutdown();
         });
     }

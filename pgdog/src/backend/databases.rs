@@ -110,6 +110,11 @@ pub fn shutdown() {
     databases().shutdown();
 }
 
+/// Rollback idle in-transaction connections across all pools.
+pub async fn rollback_idle_transactions() {
+    databases().rollback_idle_transactions().await;
+}
+
 /// Cancel all queries running on a database.
 pub async fn cancel_all(database: &str) -> Result<(), Error> {
     let clusters: Vec<_> = databases()
@@ -425,6 +430,15 @@ impl Databases {
         }
 
         Ok(moved)
+    }
+
+    async fn rollback_idle_transactions(&self) {
+        let futures: Vec<_> = self
+            .all()
+            .values()
+            .map(|cluster| cluster.rollback_idle_transactions())
+            .collect();
+        futures::future::join_all(futures).await;
     }
 
     /// Shutdown all pools.
