@@ -105,7 +105,11 @@ impl ExplainRecorder {
         };
 
         if let Some(hint) = role {
-            let prefix = if hint.is_prefer() { "prefer-" } else { "" };
+            let prefix = if hint.is_prefer_variant() {
+                "prefer-"
+            } else {
+                ""
+            };
             description.push_str(&format!(" role={}{}", prefix, hint.role()));
         }
 

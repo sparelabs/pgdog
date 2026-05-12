@@ -41,7 +41,7 @@ use pgdog_plugin::pg_query::{
 };
 use plugins::PluginOutput;
 
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 fn apply_role_hint(route: &mut Route, hint: &RoleHint) {
     if matches!(hint, RoleHint::Any) {
@@ -55,14 +55,14 @@ fn apply_role_hint(route: &mut Route, hint: &RoleHint) {
         return;
     }
     if !route.read_eligible() {
-        if hint.is_prefer() {
+        if hint.respects_read_eligible() {
             trace!(
                 "role hint {:?} ignored: statement is not read-eligible",
                 hint
             );
             return;
         }
-        debug!("{:?} applied to non-read-eligible statement", hint);
+        warn!("{:?} applied to non-read-eligible statement", hint);
     }
     match hint.role() {
         Role::Replica => route.set_read(true),

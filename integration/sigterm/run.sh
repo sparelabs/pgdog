@@ -48,10 +48,15 @@ if [ -z "${backend_pid}" ] || [ "${backend_pid}" = "" ]; then
     exit 1
 fi
 
+# Capture backend_start to uniquely identify the session even if PID is recycled.
+backend_start=$(psql -h 127.0.0.1 -U pgdog -d pgdog -At -c \
+    "SELECT backend_start FROM pg_stat_activity WHERE pid = ${backend_pid}" 2>/dev/null)
+echo "Backend start: ${backend_start}"
+
 # Step 2: Verify precondition — the backend IS in idle-in-transaction state.
 sleep 0.5
 state=$(psql -h 127.0.0.1 -U pgdog -d pgdog -At -c \
-    "SELECT state FROM pg_stat_activity WHERE pid = ${backend_pid}")
+    "SELECT state FROM pg_stat_activity WHERE pid = ${backend_pid} AND backend_start = '${backend_start}'")
 echo "Backend state before SIGTERM: ${state}"
 
 if [ "${state}" != "idle in transaction" ]; then
@@ -85,7 +90,7 @@ wait "${TXCONN_PID}" 2>/dev/null || true
 # Step 4: Assert — the backend should NOT still be in idle-in-transaction.
 sleep 0.5
 state_after=$(psql -h 127.0.0.1 -U pgdog -d pgdog -At -c \
-    "SELECT state FROM pg_stat_activity WHERE pid = ${backend_pid}" 2>/dev/null || echo "gone")
+    "SELECT state FROM pg_stat_activity WHERE pid = ${backend_pid} AND backend_start = '${backend_start}'" 2>/dev/null || echo "gone")
 echo "Backend state after SIGTERM: ${state_after}"
 
 if [ "${state_after}" = "idle in transaction" ]; then

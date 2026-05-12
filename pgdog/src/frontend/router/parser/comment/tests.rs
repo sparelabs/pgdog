@@ -422,6 +422,14 @@ fn test_remove_comment_pgdog_directive() {
 }
 
 #[test]
+fn test_remove_comment_trailing_with_trailing_whitespace() {
+    let schema = test_schema();
+    let qac = parse_edge_comment("SELECT 1 /* c */\t\n", &schema).unwrap();
+    assert_eq!(qac.query, "SELECT 1");
+    assert_eq!(qac.comment, "/* c */");
+}
+
+#[test]
 fn test_sharding_key_with_schema_name() {
     use crate::backend::replication::ShardedSchemas;
     use pgdog_config::sharding::ShardedSchema;

@@ -29,6 +29,7 @@ fn cross_shard_route() -> Route {
         Default::default(),
         Limit::default(),
         None,
+        false,
     )
 }
 

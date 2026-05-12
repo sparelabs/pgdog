@@ -262,6 +262,7 @@ mod tests {
             Default::default(),
             Limit::default(),
             None,
+            false,
         )
     }
 
@@ -272,6 +273,7 @@ mod tests {
             Default::default(),
             Limit::default(),
             None,
+            false,
         )
     }
 

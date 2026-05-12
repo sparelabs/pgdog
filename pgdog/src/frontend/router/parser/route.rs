@@ -116,16 +116,13 @@ impl Display for Route {
 
 impl Route {
     /// Create new route for a `SELECT` query.
-    ///
-    /// `read_eligible` defaults to `false` -- callers must set it via
-    /// `set_read_eligible()` after evaluating CTE writes, locking, and
-    /// function side-effects.
     pub fn select(
         shard: ShardWithPriority,
         order_by: Vec<OrderBy>,
         aggregate: Aggregate,
         limit: Limit,
         distinct: Option<DistinctBy>,
+        read_eligible: bool,
     ) -> Self {
         Self {
             shard,
@@ -134,6 +131,7 @@ impl Route {
             aggregate,
             limit,
             distinct,
+            read_eligible,
             ..Default::default()
         }
     }
@@ -696,6 +694,7 @@ mod test {
             Default::default(),
             Limit::default(),
             None,
+            false,
         );
         assert!(route.should_buffer());
     }
@@ -711,6 +710,7 @@ mod test {
                 offset: None,
             },
             None,
+            false,
         );
         assert!(!route.should_buffer());
     }
@@ -726,6 +726,7 @@ mod test {
                 offset: Some(5),
             },
             None,
+            false,
         );
         assert!(route.should_buffer());
     }
@@ -741,6 +742,7 @@ mod test {
                 offset: Some(5),
             },
             None,
+            false,
         );
         assert!(route.should_buffer());
     }
@@ -753,6 +755,7 @@ mod test {
             Default::default(),
             Limit::default(),
             None,
+            false,
         );
         assert!(!route.should_buffer());
     }
@@ -803,6 +806,7 @@ mod test {
             Default::default(),
             Limit::default(),
             None,
+            false,
         );
         assert!(!route.read_eligible());
     }

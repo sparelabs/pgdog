@@ -77,6 +77,6 @@ pub(super) fn trailing_block_comment(q: &str) -> Option<(&str, &str)> {
 
     let start_idx = first_start?;
     let comment = &trimmed[start_idx..];
-    let rest = q[..start_idx].trim_end_matches(is_edge_whitespace);
+    let rest = trimmed[..start_idx].trim_end_matches(is_edge_whitespace);
     Some((rest, comment))
 }

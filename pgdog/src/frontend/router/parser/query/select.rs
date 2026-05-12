@@ -218,14 +218,13 @@ impl QueryParser {
             aggregates,
             limit,
             distinct,
+            read_eligible,
         );
 
         // Only rewrite if query is cross-shard.
         if query.is_cross_shard() && context.shards > 1 {
             query.with_aggregate_rewrite_plan_mut(cached_ast.rewrite_plan.aggregates.clone());
         }
-
-        query.set_read_eligible(read_eligible);
 
         Ok(Command::Query(
             query

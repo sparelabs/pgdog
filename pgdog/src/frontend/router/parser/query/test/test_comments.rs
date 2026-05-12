@@ -503,6 +503,17 @@ fn test_prefer_primary_comment_prefer_replica_overrides_connection_prefer_primar
     assert!(!command.route().prefer_primary());
 }
 
+#[test]
+fn test_prefer_replica_comment_does_not_redirect_locking_select() {
+    let mut test = QueryParserTest::new();
+    let command = test.execute(vec![Query::new(
+        "/* pgdog_role: prefer-replica */ SELECT * FROM foo FOR UPDATE",
+    )
+    .into()]);
+    assert!(command.route().is_write());
+    assert!(!command.route().read_eligible());
+}
+
 // --- `any` role hint tests ---
 
 #[test]

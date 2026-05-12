@@ -35,8 +35,6 @@ impl QueryEngine {
 
         // We need to run a query now.
         if context.in_transaction() {
-            // Connect to one shard if not sharded or to all shards
-            // for a cross-shard tranasction.
             if !self.connect_transaction(context).await? {
                 return Ok(());
             }
@@ -66,13 +64,10 @@ impl QueryEngine {
         {
             Ok(response) => response?,
             Err(err) => {
-                // Close the conn, it could be stuck executing a query
-                // or dead.
                 self.backend.force_close();
                 return Err(err.into());
             }
         }
-
         Ok(())
     }
 

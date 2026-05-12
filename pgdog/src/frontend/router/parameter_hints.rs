@@ -30,11 +30,15 @@ impl RoleHint {
         }
     }
 
-    pub fn is_prefer(&self) -> bool {
+    pub fn respects_read_eligible(&self) -> bool {
         matches!(
             self,
             RoleHint::PreferPrimary | RoleHint::PreferReplica | RoleHint::Any
         )
+    }
+
+    pub fn is_prefer_variant(&self) -> bool {
+        matches!(self, RoleHint::PreferPrimary | RoleHint::PreferReplica)
     }
 }
 
@@ -181,7 +185,8 @@ mod tests {
     fn test_any_from_str() {
         assert_eq!("any".parse::<RoleHint>(), Ok(RoleHint::Any));
         assert_eq!(RoleHint::Any.role(), Role::Auto);
-        assert!(RoleHint::Any.is_prefer());
+        assert!(RoleHint::Any.respects_read_eligible());
+        assert!(!RoleHint::Any.is_prefer_variant());
     }
 
     #[test]

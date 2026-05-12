@@ -5,6 +5,8 @@ use crate::backend::ShardingSchema;
 use crate::frontend::router::parameter_hints::RoleHint;
 use crate::frontend::router::sharding::ContextBuilder;
 
+use tracing::warn;
+
 use super::super::Error;
 use super::super::Shard;
 
@@ -48,17 +50,19 @@ pub(super) fn shard_role_from_comment(
     }
     if let Some(cap) = SHARD.captures(comment) {
         if let Some(shard) = cap.get(1) {
-            return Ok((
-                Some(
-                    shard
-                        .as_str()
-                        .parse::<usize>()
-                        .ok()
-                        .map(Shard::Direct)
-                        .unwrap_or(Shard::All),
-                ),
-                role,
-            ));
+            let parsed = shard.as_str().parse::<usize>();
+            let shard_value = match parsed {
+                Ok(n) => Shard::Direct(n),
+                Err(e) => {
+                    warn!(
+                        "pgdog_shard {:?} parse failed ({}); broadcasting to all shards",
+                        shard.as_str(),
+                        e
+                    );
+                    Shard::All
+                }
+            };
+            return Ok((Some(shard_value), role));
         }
     }
 

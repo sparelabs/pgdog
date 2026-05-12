@@ -189,6 +189,8 @@ impl LoadBalancer {
         if let Some(target) = self.targets.get(idx).filter(|t| t.role() == Role::Primary) {
             return Some(target);
         }
+        // Fallback linear scan — only runs when the cached index is stale
+        // (e.g. during failover). Self-heals once the cache is updated.
         let found = self.targets.iter().rposition(|t| t.role() == Role::Primary);
         if let Some(idx) = found {
             self.primary_idx.store(idx, Ordering::Release);
@@ -386,6 +388,7 @@ impl LoadBalancer {
         use ReadWriteSplit::*;
 
         let mut candidates: Candidates<'_> = Vec::with_capacity(self.targets.len());
+        let mut primaries: Candidates<'_> = Vec::new();
         let mut total_replicas: u32 = 0;
         let mut banned_replicas: u32 = 0;
 
@@ -393,23 +396,31 @@ impl LoadBalancer {
             if target.pool.config().resharding_only {
                 continue;
             }
-            if target.role() == Role::Replica {
-                total_replicas += 1;
-                if target.ban.banned() {
-                    banned_replicas += 1;
+            match target.role() {
+                Role::Primary => {
+                    primaries.push(target);
+                }
+                Role::Replica => {
+                    total_replicas += 1;
+                    if target.ban.banned() {
+                        banned_replicas += 1;
+                    }
+                    candidates.push(target);
+                }
+                Role::Auto => {
+                    candidates.push(target);
                 }
             }
-            candidates.push(target);
         }
 
-        let primary_reads = match self.rw_split {
+        let include_primary = match self.rw_split {
             IncludePrimary => true,
             IncludePrimaryIfReplicaBanned | PreferPrimary => total_replicas == banned_replicas,
             ExcludePrimary => total_replicas == 0,
         };
 
-        if !primary_reads {
-            candidates.retain(|target| matches!(target.role(), Role::Replica | Role::Auto));
+        if include_primary {
+            candidates.extend(primaries);
         }
 
         if candidates.is_empty() {
@@ -429,8 +440,11 @@ impl LoadBalancer {
                 candidates.rotate_left(first);
             }
             LeastActiveConnections => {
-                candidates.sort_by_cached_key(|target| target.pool.lock().checked_out());
+                candidates.sort_by_cached_key(|target| target.pool.checked_out_count());
             }
+            // Relaxed ordering means concurrent readers may see slightly stale
+            // weights, producing imperfect distribution under high concurrency.
+            // Acceptable for load-balancing fairness.
             WeightedRoundRobin => {
                 let total_weight: i64 = candidates
                     .iter()
@@ -490,6 +504,8 @@ impl LoadBalancer {
         Err(Error::AllReplicasDown)
     }
 
+    /// Try the primary first; fall back to replicas if the primary is banned or
+    /// fails checkout. Used by `PreferPrimary` read-write split mode.
     pub(crate) async fn preferred_read(&self, request: &Request) -> Result<Guard, Error> {
         let primary = self.primary_target();
         let primary_was_banned = primary.is_none_or(|t| t.ban.banned());
@@ -524,9 +540,9 @@ impl LoadBalancer {
         }
 
         let result = self.try_candidates(&mut candidates, request).await;
-        // Only unban the primary if preferred_read itself banned it. If the
-        // primary was already banned externally (health check, write path),
-        // preserve that ban to avoid masking a legitimate outage.
+        // Only unban the primary if preferred_read itself banned it above.
+        // If the primary was already banned externally (health check, write
+        // path), preserve that ban to avoid masking a legitimate outage.
         if result.is_err() && !primary_was_banned {
             if let Some(p) = primary {
                 p.ban.unban(true);
