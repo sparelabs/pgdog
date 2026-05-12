@@ -9,6 +9,8 @@ on:
 jobs:
   tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v6
       - name: Install CI deps
@@ -28,9 +30,7 @@ jobs:
         run: cargo test --doc
       # Requires CODECOV_TOKEN secret for upload
       - uses: codecov/codecov-action@v4
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        if: ${{ env.CODECOV_TOKEN != '' }}
         with:
           files: lcov.info
           flags: unit
