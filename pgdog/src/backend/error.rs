@@ -161,6 +161,7 @@ impl Error {
             Error::Pool(PoolError::AllReplicasDown) => true,
             Error::Pool(PoolError::PreferredReadUnavailable) => true,
             Error::Pool(PoolError::Banned) => true,
+            Error::Pool(PoolError::Offline) => true,
             _ => false,
         }
     }

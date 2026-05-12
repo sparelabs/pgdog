@@ -336,7 +336,7 @@ impl Pool {
             for server in idle {
                 to_guard.put(server, now)?;
             }
-            to_guard.set_taken(taken);
+            to_guard.merge_taken(taken);
 
             let from_after = from_guard.checked_out();
             let to_after = to_guard.checked_out();

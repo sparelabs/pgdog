@@ -62,6 +62,19 @@ impl Taken {
         self.client_server.values().copied().collect()
     }
 
+    pub(super) fn merge(&mut self, other: Taken) {
+        for (key, mapping) in other.taken {
+            self.taken.entry(key).or_insert(mapping);
+        }
+        for (server, counter) in other.server_client {
+            self.server_client.entry(server).or_insert(counter);
+        }
+        for (client, server) in other.client_server {
+            self.client_server.entry(client).or_insert(server);
+        }
+        self.counter = self.counter.max(other.counter);
+    }
+
     #[cfg(test)]
     pub(super) fn clear(&mut self) {
         self.taken.clear();

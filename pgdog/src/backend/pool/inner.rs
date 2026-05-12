@@ -280,8 +280,8 @@ impl Inner {
     }
 
     #[inline]
-    pub(super) fn set_taken(&mut self, taken: Taken) {
-        self.taken = taken;
+    pub(super) fn merge_taken(&mut self, taken: Taken) {
+        self.taken.merge(taken);
     }
 
     /// Dump all idle connections.
@@ -1054,7 +1054,7 @@ mod test {
     }
 
     #[test]
-    fn test_set_taken() {
+    fn test_merge_taken() {
         let mut inner = Inner::default();
         let mapping = Mapping {
             client: BackendKeyData::new(),
@@ -1066,7 +1066,7 @@ mod test {
         let mut taken = Taken::default();
         taken.take(&mapping).unwrap();
 
-        inner.set_taken(taken);
+        inner.merge_taken(taken);
         assert_eq!(inner.checked_out(), 1);
     }
 
