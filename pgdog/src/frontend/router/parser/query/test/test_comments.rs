@@ -595,3 +595,15 @@ fn test_any_does_not_leak_between_queries() {
     let second = test.execute(vec![Query::new("SELECT 1").into()]);
     assert!(!second.route().any_target());
 }
+
+#[test]
+fn test_any_param_sets_any_target_in_transaction() {
+    let mut test = QueryParserTest::new()
+        .with_param("pgdog.role", "any")
+        .in_transaction(true);
+
+    let command = test.execute(vec![Query::new("SELECT 1").into()]);
+
+    assert!(command.route().is_read());
+    assert!(command.route().any_target());
+}

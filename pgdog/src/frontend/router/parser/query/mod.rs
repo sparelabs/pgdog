@@ -67,7 +67,7 @@ fn apply_role_hint(route: &mut Route, hint: &RoleHint) {
     match hint.role() {
         Role::Replica => route.set_read(true),
         Role::Primary => route.set_read(false),
-        Role::Auto => unreachable!("RoleHint never maps to Auto"),
+        Role::Auto => return,
     }
     route.set_prefer_primary(false);
 }
@@ -201,7 +201,10 @@ impl QueryParser {
     }
 
     /// Bypass the query parser if we can.
-    fn query_parser_bypass(context: &mut QueryParserContext) -> Option<Route> {
+    fn query_parser_bypass(
+        context: &mut QueryParserContext,
+        role_hint: Option<&RoleHint>,
+    ) -> Option<Route> {
         let shard = context.shards_calculator.shard();
 
         if !shard.is_direct() && context.shards > 1 {
@@ -227,7 +230,7 @@ impl QueryParser {
             Some(Route::write(shard))
 
         // The role is specified in the connection parameter (pgdog.role).
-        } else if let Some(hint) = context.router_context.parameter_hints.compute_role() {
+        } else if let Some(hint) = role_hint {
             Some(match hint.role() {
                 Role::Replica => Route::read(shard),
                 Role::Primary => Route::write(shard),
@@ -261,21 +264,12 @@ impl QueryParser {
         );
 
         if !use_parser {
-            // Try to figure out where we can send the query without
-            // parsing SQL.
-            if let Some(route) = Self::query_parser_bypass(context) {
-                let has_role_hint = context
-                    .router_context
-                    .parameter_hints
-                    .compute_role()
-                    .is_some();
-                // Bypass already resolved the role from the parameter hint
-                // (or defaulted to primary). read_eligible is not checked
-                // because without the parser we don't know the statement type.
+            let role_hint = context.router_context.parameter_hints.compute_role();
+            if let Some(route) = Self::query_parser_bypass(context, role_hint.as_ref()) {
                 return Ok(QueryResult {
                     command: Command::Query(route),
                     comment_role_hint: None,
-                    role_already_applied: has_role_hint,
+                    role_already_applied: role_hint.is_some(),
                 });
             } else {
                 return Err(Error::QueryParserRequired);

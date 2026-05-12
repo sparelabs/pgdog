@@ -49,11 +49,12 @@ impl QueryParser {
                 None,
             )
             .extract_advisory_locks();
-            let mut query = Route::read(context.shards_calculator.shard().clone())
-                .with_functions(overrides)
-                .with_advisory_locks(advisory_locks);
-            query.set_read_eligible(read_eligible);
-            return Ok(Command::Query(query));
+            return Ok(Command::Query(
+                Route::read(context.shards_calculator.shard().clone())
+                    .with_functions(overrides)
+                    .with_advisory_locks(advisory_locks)
+                    .with_read_eligible(read_eligible),
+            ));
         }
 
         let mut shards = HashSet::new();
@@ -104,11 +105,12 @@ impl QueryParser {
                 .shards_calculator
                 .push(ShardWithPriority::new_rr_no_table(shard));
 
-            let mut query = Route::read(context.shards_calculator.shard().clone())
-                .with_functions(overrides)
-                .with_advisory_locks(advisory_locks);
-            query.set_read_eligible(read_eligible);
-            return Ok(Command::Query(query));
+            return Ok(Command::Query(
+                Route::read(context.shards_calculator.shard().clone())
+                    .with_functions(overrides)
+                    .with_advisory_locks(advisory_locks)
+                    .with_read_eligible(read_eligible),
+            ));
         }
 
         let order_by = Self::select_sort(&stmt.sort_clause, context.router_context.bind);

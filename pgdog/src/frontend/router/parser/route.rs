@@ -278,6 +278,11 @@ impl Route {
         self.read_eligible = read_eligible;
     }
 
+    pub fn with_read_eligible(mut self, read_eligible: bool) -> Self {
+        self.set_read_eligible(read_eligible);
+        self
+    }
+
     pub fn prefer_primary(&self) -> bool {
         self.prefer_primary
     }

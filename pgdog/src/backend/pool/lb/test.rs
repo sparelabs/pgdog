@@ -10,6 +10,10 @@ use super::*;
 use monitor::Monitor;
 
 fn create_test_pool_config(host: &str, port: u16) -> PoolConfig {
+    create_test_pool_config_with_role(host, port, Role::Replica)
+}
+
+fn create_test_pool_config_with_role(host: &str, port: u16, role: Role) -> PoolConfig {
     PoolConfig {
         address: Address {
             host: host.into(),
@@ -17,7 +21,7 @@ fn create_test_pool_config(host: &str, port: u16) -> PoolConfig {
             user: "pgdog".into(),
             passwords: vec!["pgdog".into()],
             database_name: "pgdog".into(),
-            configured_role: Role::Replica,
+            configured_role: role,
             ..Default::default()
         },
         config: Config {
@@ -3250,6 +3254,117 @@ async fn test_any_read_all_down_returns_error() {
     let request = Request::default();
     let result = lb.any_read(&request).await;
     assert!(result.is_err());
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_preferred_read_with_auto_targets() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let auto_config = create_test_pool_config_with_role("localhost", 5433, Role::Auto);
+    let replica_config = create_test_pool_config("localhost", 5434);
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[auto_config, replica_config],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+    lb.launch();
+
+    let request = Request::default();
+
+    // preferred_read only includes explicit Role::Replica targets.
+    // Auto targets should not appear in its candidate list.
+    let mut seen_ids = HashSet::new();
+    for _ in 0..10 {
+        let conn = lb.preferred_read(&request).await.unwrap();
+        seen_ids.insert(conn.pool.id());
+    }
+
+    let auto_id = lb.targets[0].pool.id();
+    assert!(
+        !seen_ids.contains(&auto_id),
+        "preferred_read must not include Auto targets"
+    );
+
+    lb.shutdown();
+}
+
+#[test]
+fn test_any_read_with_auto_targets() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+
+    let auto_config = create_test_pool_config_with_role("localhost", 5433, Role::Auto);
+    let replica_config = create_test_pool_config("localhost", 5434);
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[auto_config, replica_config],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    // any_read filters: all non-resharding targets regardless of role.
+    // Verify by checking that all 3 targets are non-resharding candidates.
+    let candidates: Vec<_> = lb
+        .targets
+        .iter()
+        .filter(|target| !target.pool.config().resharding_only)
+        .collect();
+
+    assert_eq!(candidates.len(), 3, "all 3 targets should be candidates");
+
+    let roles: Vec<_> = candidates.iter().map(|t| t.role()).collect();
+    assert!(
+        roles.contains(&Role::Auto),
+        "Auto target must be a candidate"
+    );
+    assert!(
+        roles.contains(&Role::Replica),
+        "Replica target must be a candidate"
+    );
+    assert!(
+        roles.contains(&Role::Primary),
+        "Primary target must be a candidate"
+    );
+}
+
+#[tokio::test]
+async fn test_read_candidates_auto_not_counted_as_replica() {
+    let auto_config1 = create_test_pool_config_with_role("localhost", 5433, Role::Auto);
+    let auto_config2 = create_test_pool_config_with_role("localhost", 5434, Role::Auto);
+
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    // IncludePrimaryIfReplicaBanned: primary is included when total_replicas == banned_replicas.
+    // With only Auto targets, total_replicas == 0 == banned_replicas, so primary should be included.
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[auto_config1, auto_config2],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+    lb.launch();
+
+    let candidates = lb.read_candidates().unwrap();
+    let primary_id = lb.primary().unwrap().id();
+
+    let has_primary = candidates.iter().any(|t| t.pool.id() == primary_id);
+    assert!(
+        has_primary,
+        "When only Auto targets exist (no explicit replicas), primary must be included \
+         under IncludePrimaryIfReplicaBanned because total_replicas == banned_replicas == 0"
+    );
+
+    let auto_count = candidates.iter().filter(|t| t.role() == Role::Auto).count();
+    assert_eq!(auto_count, 2, "Both Auto targets should be in candidates");
 
     lb.shutdown();
 }

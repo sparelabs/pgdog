@@ -110,6 +110,38 @@ fn test_replica_role_detection() {
 }
 
 #[test]
+fn test_prefer_primary_role_detection() {
+    let schema = test_schema();
+    let query = "SELECT * FROM users /* pgdog_role: prefer-primary */";
+    let result = parse_edge_comment(query, &schema).unwrap();
+    assert_eq!(result.role, Some(RoleHint::PreferPrimary));
+}
+
+#[test]
+fn test_prefer_primary_underscore_role_detection() {
+    let schema = test_schema();
+    let query = "SELECT * FROM users /* pgdog_role: prefer_primary */";
+    let result = parse_edge_comment(query, &schema).unwrap();
+    assert_eq!(result.role, Some(RoleHint::PreferPrimary));
+}
+
+#[test]
+fn test_prefer_replica_role_detection() {
+    let schema = test_schema();
+    let query = "SELECT * FROM users /* pgdog_role: prefer-replica */";
+    let result = parse_edge_comment(query, &schema).unwrap();
+    assert_eq!(result.role, Some(RoleHint::PreferReplica));
+}
+
+#[test]
+fn test_any_role_detection() {
+    let schema = test_schema();
+    let query = "SELECT * FROM users /* pgdog_role: any */";
+    let result = parse_edge_comment(query, &schema).unwrap();
+    assert_eq!(result.role, Some(RoleHint::Any));
+}
+
+#[test]
 fn test_invalid_role_detection() {
     let schema = test_schema();
     let query = "SELECT * FROM users /* pgdog_role: invalid */";
