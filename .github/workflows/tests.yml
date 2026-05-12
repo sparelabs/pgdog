@@ -28,6 +28,7 @@ jobs:
         run: cargo test --doc
       # Requires CODECOV_TOKEN secret for upload
       - uses: codecov/codecov-action@v4
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:
