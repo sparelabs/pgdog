@@ -8,7 +8,7 @@ mod tests;
 pub use query::QueryWithoutComment;
 
 use crate::backend::ShardingSchema;
-use crate::config::database::Role;
+use crate::frontend::router::parameter_hints::RoleHint;
 
 use super::Error;
 use super::Shard;
@@ -19,7 +19,7 @@ pub struct QueryAndComment<'a> {
     pub query: QueryWithoutComment<'a>,
     #[cfg(test)]
     pub comment: String,
-    pub role: Option<Role>,
+    pub role: Option<RoleHint>,
     pub shard: Option<Shard>,
 }
 

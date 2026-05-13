@@ -1580,9 +1580,14 @@
           "const": "exclude_primary"
         },
         {
-          "description": "Sends reads to the primary only if one or more replicas have been banned.",
+          "description": "Sends reads to the primary only if all replicas have been banned.",
           "type": "string",
           "const": "include_primary_if_replica_banned"
+        },
+        {
+          "description": "Routes all queries to the primary by default. Queries annotated with `/* pgdog_role: prefer-replica */` are sent to replicas. If all replicas are banned, annotated reads fall back to primary.",
+          "type": "string",
+          "const": "prefer_primary"
         }
       ]
     },

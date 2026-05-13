@@ -21,7 +21,7 @@ queries = [
 def conn_reads():
     return psycopg2.connect(
         "host=127.0.0.1 port=6432 user=pgdog password=pgdog "
-        "options='-c pgdog.role=replica'"
+        "options='-c pgdog.role=prefer-replica'"
     )
 
 
@@ -29,7 +29,7 @@ def conn_reads():
 def conn_writes():
     return psycopg2.connect(
         "host=127.0.0.1 port=6432 user=pgdog password=pgdog "
-        "options='-c pgdog.role=primary'"
+        "options='-c pgdog.role=prefer-primary'"
     )
 
 

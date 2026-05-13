@@ -57,17 +57,23 @@ pub fn replace_databases(new_databases: Databases, reload: bool) -> Result<(), E
     //    wakes waiters on drop, even if a step below errors out.
     let _guard = reload_notify::started();
 
-    // 2. Move connections from old databases into new ones.
     let old_databases = databases();
     let new_databases = Arc::new(new_databases);
+
+    // 2. Swap DATABASES to point to new pools before marking old ones offline.
+    //    This way any client retry via safe_reload() immediately gets new pools.
+    DATABASES.store(Arc::clone(&new_databases));
+
+    // 3. Move connections from old databases into new ones.
     if reload {
-        // Move whatever connections we can over to new pools.
         old_databases.move_conns_to(&new_databases)?;
     }
-    // 3. Launch new databases first.
+
+    // 4. Launch new databases after move so maintenance sees transferred connections
+    //    and doesn't create duplicates.
     new_databases.launch();
-    DATABASES.store(new_databases);
-    // 4. Shutdown all databases.
+
+    // 5. Shutdown old databases.
     old_databases.shutdown();
 
     Ok(())
@@ -108,6 +114,11 @@ pub fn init() -> Result<(), Error> {
 /// Shutdown all databases.
 pub fn shutdown() {
     databases().shutdown();
+}
+
+/// Drain all pools: dump idle connections and close any returned from now on.
+pub fn drain() {
+    databases().drain();
 }
 
 /// Cancel all queries running on a database.
@@ -425,6 +436,12 @@ impl Databases {
         }
 
         Ok(moved)
+    }
+
+    fn drain(&self) {
+        for cluster in self.all().values() {
+            cluster.drain();
+        }
     }
 
     /// Shutdown all pools.

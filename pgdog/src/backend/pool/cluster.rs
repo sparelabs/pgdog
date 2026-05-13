@@ -61,6 +61,7 @@ pub struct Cluster {
     replication_sharding: Option<String>,
     multi_tenant: Option<MultiTenant>,
     rw_strategy: ReadWriteStrategy,
+    rw_split: ReadWriteSplit,
     schema_admin: bool,
     stats: Arc<Mutex<MirrorStats>>,
     cross_shard_disabled: bool,
@@ -292,6 +293,7 @@ impl Cluster {
             replication_sharding,
             multi_tenant: multi_tenant.clone(),
             rw_strategy,
+            rw_split,
             schema_admin,
             stats: Arc::new(Mutex::new(MirrorStats::default())),
             cross_shard_disabled,
@@ -336,6 +338,18 @@ impl Cluster {
     pub async fn replica(&self, shard: usize, request: &Request) -> Result<Guard, Error> {
         let shard = self.shards.get(shard).ok_or(Error::NoShard(shard))?;
         shard.replica(request).await
+    }
+
+    /// Get a read connection, preferring the primary and falling back to replicas.
+    pub async fn preferred_read(&self, shard: usize, request: &Request) -> Result<Guard, Error> {
+        let shard = self.shards.get(shard).ok_or(Error::NoShard(shard))?;
+        shard.preferred_read(request).await
+    }
+
+    /// Get a read connection from any target (primary or replica), ignoring rw_split.
+    pub async fn any_read(&self, shard: usize, request: &Request) -> Result<Guard, Error> {
+        let shard = self.shards.get(shard).ok_or(Error::NoShard(shard))?;
+        shard.any_read(request).await
     }
 
     /// The two clusters have the same databases.
@@ -542,6 +556,11 @@ impl Cluster {
         &self.rw_strategy
     }
 
+    /// Read/write split
+    pub fn read_write_split(&self) -> ReadWriteSplit {
+        self.rw_split
+    }
+
     /// Cross-shard queries disabled for this cluster.
     pub fn cross_shard_disabled(&self) -> bool {
         self.cross_shard_disabled
@@ -621,6 +640,12 @@ impl Cluster {
                     }
                 }
             });
+        }
+    }
+
+    pub(crate) fn drain(&self) {
+        for shard in self.shards() {
+            shard.drain();
         }
     }
 
@@ -718,6 +743,7 @@ mod test {
                 config: Config::default(),
             }];
 
+            let rw_split = config.config.general.read_write_split;
             let shards = (0..2)
                 .map(|number| {
                     Shard::new(ShardConfig {
@@ -725,7 +751,7 @@ mod test {
                         primary,
                         replicas,
                         lb_strategy: LoadBalancingStrategy::Random,
-                        rw_split: ReadWriteSplit::IncludePrimary,
+                        rw_split,
                         identifier: identifier.clone(),
                         lsn_check_interval: Duration::MAX,
                         pub_sub_enabled: false,
@@ -804,6 +830,7 @@ mod test {
                 ]),
                 shards,
                 identifier,
+                rw_split,
                 prepared_statements: config.config.general.prepared_statements,
                 dry_run: config.config.general.dry_run,
                 expanded_explain: config.config.general.expanded_explain,
@@ -831,6 +858,7 @@ mod test {
                 user: "pgdog".into(),
                 database: "pgdog".into(),
             });
+            let rw_split = config.config.general.read_write_split;
 
             Cluster {
                 shards: vec![Shard::new(ShardConfig {
@@ -841,11 +869,12 @@ mod test {
                     }),
                     replicas: &[],
                     lb_strategy: LoadBalancingStrategy::default(),
-                    rw_split: ReadWriteSplit::default(),
+                    rw_split,
                     identifier: identifier.clone(),
                     lsn_check_interval: Duration::default(),
                     pub_sub_enabled: false,
                 })],
+                rw_split,
                 prepared_statements: config.config.general.prepared_statements,
                 dry_run: config.config.general.dry_run,
                 expanded_explain: config.config.general.expanded_explain,
@@ -863,6 +892,14 @@ mod test {
 
         pub fn set_read_write_strategy(&mut self, rw_strategy: ReadWriteStrategy) {
             self.rw_strategy = rw_strategy;
+        }
+
+        pub fn set_read_write_split(&mut self, rw_split: ReadWriteSplit) {
+            self.rw_split = rw_split;
+        }
+
+        pub fn set_dry_run(&mut self, dry_run: bool) {
+            self.dry_run = dry_run;
         }
     }
 

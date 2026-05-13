@@ -63,7 +63,12 @@ pub(super) fn trailing_block_comment(q: &str) -> Option<(&str, &str)> {
         };
         // If the body contains `*/`, the trailing `*/` pairs with an earlier
         // `/*` we can't see from here — stop.
-        if memmem::find(inner[s + start.len()..].as_bytes(), end.as_bytes()).is_some() {
+        if memmem::find(
+            inner.as_bytes().get(s + start.len()..).unwrap_or_default(),
+            end.as_bytes(),
+        )
+        .is_some()
+        {
             break;
         }
         first_start = Some(s);
@@ -72,6 +77,6 @@ pub(super) fn trailing_block_comment(q: &str) -> Option<(&str, &str)> {
 
     let start_idx = first_start?;
     let comment = &trimmed[start_idx..];
-    let rest = q[..start_idx].trim_end_matches(is_edge_whitespace);
+    let rest = trimmed[..start_idx].trim_end_matches(is_edge_whitespace);
     Some((rest, comment))
 }

@@ -97,6 +97,17 @@ async fn test_pool_checkout() {
 #[tokio::test]
 async fn test_concurrency() {
     let pool = pool();
+
+    let config = Config {
+        inner: pgdog_stats::Config {
+            max: 1,
+            min: 1,
+            checkout_timeout: Duration::from_secs(15),
+            ..Config::default().inner
+        },
+    };
+    pool.update_config(config);
+
     let tracker = TaskTracker::new();
 
     for _ in 0..1000 {

@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use pgdog_config::Role;
 
 use super::parser::Error;
@@ -10,6 +12,51 @@ use crate::{
     net::{parameter::ParameterValue, Parameters},
 };
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum RoleHint {
+    PreferPrimary,
+    PreferReplica,
+    Primary,
+    Replica,
+    Any,
+}
+
+impl RoleHint {
+    pub fn role(&self) -> Role {
+        match self {
+            RoleHint::PreferPrimary | RoleHint::Primary => Role::Primary,
+            RoleHint::PreferReplica | RoleHint::Replica => Role::Replica,
+            RoleHint::Any => Role::Auto,
+        }
+    }
+
+    pub fn respects_read_eligible(&self) -> bool {
+        matches!(
+            self,
+            RoleHint::PreferPrimary | RoleHint::PreferReplica | RoleHint::Any
+        )
+    }
+
+    pub fn is_prefer_variant(&self) -> bool {
+        matches!(self, RoleHint::PreferPrimary | RoleHint::PreferReplica)
+    }
+}
+
+impl FromStr for RoleHint {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "prefer-primary" | "prefer_primary" => Ok(RoleHint::PreferPrimary),
+            "prefer-replica" | "prefer_replica" => Ok(RoleHint::PreferReplica),
+            "primary" => Ok(RoleHint::Primary),
+            "replica" => Ok(RoleHint::Replica),
+            "any" => Ok(RoleHint::Any),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParameterHints<'a> {
     pub search_path: Option<&'a ParameterValue>,
@@ -17,16 +64,23 @@ pub struct ParameterHints<'a> {
     pub pgdog_sharding_key: Option<&'a ParameterValue>,
     pub pgdog_role: Option<&'a ParameterValue>,
     hooks: ParserHooks,
+    cached_role: Option<RoleHint>,
 }
 
 impl<'a> From<&'a Parameters> for ParameterHints<'a> {
     fn from(value: &'a Parameters) -> Self {
+        let pgdog_role = value.get("pgdog.role");
+        let cached_role = match pgdog_role {
+            Some(ParameterValue::String(val)) => val.parse::<RoleHint>().ok(),
+            _ => None,
+        };
         Self {
             search_path: value.search_path(),
             pgdog_shard: value.get("pgdog.shard"),
-            pgdog_role: value.get("pgdog.role"),
+            pgdog_role,
             pgdog_sharding_key: value.get("pgdog.sharding_key"),
             hooks: ParserHooks::default(),
+            cached_role,
         }
     }
 }
@@ -95,22 +149,11 @@ impl ParameterHints<'_> {
     }
 
     /// Compute role from parameter value.
-    pub(crate) fn compute_role(&self) -> Option<Role> {
-        let role = match self.pgdog_role {
-            Some(ParameterValue::String(val)) => match val.as_str() {
-                "replica" => Some(Role::Replica),
-                "primary" => Some(Role::Primary),
-                _ => None,
-            },
-
-            _ => None,
-        };
-
-        if let Some(role) = &role {
-            self.hooks.record_set_role(role);
+    pub(crate) fn compute_role(&self) -> Option<RoleHint> {
+        if let Some(hint) = &self.cached_role {
+            self.hooks.record_set_role(&hint.role());
         }
-
-        role
+        self.cached_role
     }
 }
 
@@ -139,6 +182,14 @@ mod tests {
     }
 
     #[test]
+    fn test_any_from_str() {
+        assert_eq!("any".parse::<RoleHint>(), Ok(RoleHint::Any));
+        assert_eq!(RoleHint::Any.role(), Role::Auto);
+        assert!(RoleHint::Any.respects_read_eligible());
+        assert!(!RoleHint::Any.is_prefer_variant());
+    }
+
+    #[test]
     fn test_sharding_key_with_schema_name() {
         let sharding_schema = make_sharding_schema(&[("sales", 1)]);
 
@@ -149,6 +200,7 @@ mod tests {
             pgdog_sharding_key: Some(&sharding_key),
             pgdog_role: None,
             hooks: ParserHooks::default(),
+            cached_role: None,
         };
 
         let mut shards = ShardsWithPriority::default();
@@ -170,6 +222,7 @@ mod tests {
             pgdog_sharding_key: Some(&sharding_key),
             pgdog_role: None,
             hooks: ParserHooks::default(),
+            cached_role: None,
         };
 
         let mut shards = ShardsWithPriority::default();

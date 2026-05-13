@@ -637,7 +637,7 @@ async def test_role_selection():
         pool_timeout=30,
         pool_recycle=3600,
         pool_pre_ping=True,
-        connect_args={"server_settings": {"pgdog.role": "primary"}},
+        connect_args={"server_settings": {"pgdog.role": "prefer-primary"}},
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=True)
 

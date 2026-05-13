@@ -61,5 +61,19 @@ php ${SCRIPT_DIR}/pdo_read_write_split.php
 
 stop_pgdog
 
+# Run prefer_primary tests
+run_pgdog ${SCRIPT_DIR}/prefer_primary
+
+export PGPORT=6432
+while ! pg_isready; do
+    sleep 1
+done
+
+pushd ${SCRIPT_DIR}/pgx
+PGDOG_READ_WRITE_SPLIT=prefer_primary go test -v -count 3 -run TestPreferPrimary
+popd
+
+stop_pgdog
+
 docker compose down
 popd

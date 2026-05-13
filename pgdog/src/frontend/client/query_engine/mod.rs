@@ -32,7 +32,7 @@ pub mod set;
 pub mod shard_key_rewrite;
 pub mod start_transaction;
 #[cfg(test)]
-mod test;
+pub(crate) mod test;
 #[cfg(test)]
 mod testing;
 pub mod two_pc;

@@ -37,7 +37,17 @@ describe 'authentication' do
       expect(pass_pool['online']).to eq('f')
 
       # Connect with passthrough user and run queries.
-      conn = PG.connect(dbname: 'pgdog', user: 'pgdog_pass', password: 'pgdog', port: 6432, host: '127.0.0.1')
+      # Retry because RELOAD + SET recreates all pools from scratch; on a
+      # loaded CI runner the freshly-launched pool may not be ready before
+      # the checkout timeout on the first attempt.
+      conn = nil
+      5.times do |attempt|
+        conn = PG.connect(dbname: 'pgdog', user: 'pgdog_pass', password: 'pgdog', port: 6432, host: '127.0.0.1')
+        break
+      rescue PG::ConnectionBad => e
+        raise e if attempt == 4
+        sleep 1
+      end
       res = conn.exec 'SELECT 1 AS one'
       expect(res[0]['one']).to eq('1')
       res = conn.exec 'SELECT 2 AS two'

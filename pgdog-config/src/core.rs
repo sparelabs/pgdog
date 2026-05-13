@@ -559,6 +559,14 @@ impl Config {
             }
         }
 
+        if self.general.read_write_split == ReadWriteSplit::PreferPrimary
+            && self.general.query_parser == QueryParserLevel::Off
+        {
+            warn!(
+                r#""read_write_split" is "prefer_primary" but the query parser is disabled — reads cannot be identified, so all queries will route to the primary; use "pgdog.role" connection parameters to route reads explicitly"#
+            );
+        }
+
         if self.general.query_parser_enabled {
             warn!(r#""query_parser_enabled" is deprecated, use "query_parser" = "on" instead"#);
             self.general.query_parser = QueryParserLevel::On;

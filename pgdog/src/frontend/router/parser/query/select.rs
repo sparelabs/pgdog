@@ -23,6 +23,7 @@ impl QueryParser {
         let cte_writes = Self::cte_writes(stmt);
         let has_locking = Self::has_locking_clause(stmt);
         let mut overrides = Self::functions(stmt)?;
+        let read_eligible = !cte_writes && !has_locking && !overrides.writes;
 
         // Write overwrite because of conservative read/write split.
         if self.write_override {
@@ -51,7 +52,8 @@ impl QueryParser {
             return Ok(Command::Query(
                 Route::read(context.shards_calculator.shard().clone())
                     .with_functions(overrides)
-                    .with_advisory_locks(advisory_locks),
+                    .with_advisory_locks(advisory_locks)
+                    .with_read_eligible(read_eligible),
             ));
         }
 
@@ -106,7 +108,8 @@ impl QueryParser {
             return Ok(Command::Query(
                 Route::read(context.shards_calculator.shard().clone())
                     .with_functions(overrides)
-                    .with_advisory_locks(advisory_locks),
+                    .with_advisory_locks(advisory_locks)
+                    .with_read_eligible(read_eligible),
             ));
         }
 
@@ -217,6 +220,7 @@ impl QueryParser {
             aggregates,
             limit,
             distinct,
+            read_eligible,
         );
 
         // Only rewrite if query is cross-shard.

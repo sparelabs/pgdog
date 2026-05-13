@@ -22,8 +22,11 @@ func (Sharded) TableName() string {
 
 func TestInit(t *testing.T) {
 	db, err := gorm.Open(postgres.Open("postgres://pgdog:pgdog@127.0.0.1:6432/pgdog"), &gorm.Config{})
-
 	assert.NoError(t, err)
+
+	sqlDB, err := db.DB()
+	assert.NoError(t, err)
+	defer sqlDB.Close()
 
 	ctx := context.Background()
 

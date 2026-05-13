@@ -4,9 +4,14 @@
 mod tests {
     use crate::{
         backend::{
-            pool::{connection::binding::Binding, Pool, PoolConfig},
+            pool::{
+                connection::binding::Binding, Cluster, Connection, Error as PoolError, Pool,
+                PoolConfig, Request,
+            },
             server::test::test_server,
+            Server,
         },
+        config::{ConfigAndUsers, Role},
         frontend::{
             client::query_engine::TwoPcPhase,
             router::{
@@ -17,6 +22,8 @@ mod tests {
     };
 
     use super::super::multi_shard::MultiShard;
+    use pgdog_config::LoadSchema;
+    use std::{collections::BTreeSet, time::Duration};
     use tokio::time::Instant;
 
     async fn create_multishard_binding() -> Binding {
@@ -60,6 +67,81 @@ mod tests {
             .expect("BEGIN should succeed");
 
         binding
+    }
+
+    #[tokio::test]
+    async fn test_connect_multishard_prefer_primary_uses_replicas_when_primaries_are_banned() {
+        crate::logger();
+
+        let mut config = ConfigAndUsers::default();
+        config.config.general.load_schema = LoadSchema::Off;
+
+        let cluster = Cluster::new_test(&config);
+
+        for shard in cluster.shards() {
+            for (_, pool) in shard.pools_with_roles() {
+                let mut server = Server::default();
+                server.stats_mut().healthcheck();
+
+                let mut guard = pool.lock();
+                guard.online = true;
+                guard
+                    .put(Box::new(server), Instant::now())
+                    .expect("seed pool with a synthetic test connection");
+            }
+        }
+
+        let expected_replica_ids: BTreeSet<_> = cluster
+            .shards()
+            .iter()
+            .map(|shard| {
+                let mut replica_ids = vec![];
+
+                for (role, ban, pool) in shard.pools_with_roles_and_bans() {
+                    match role {
+                        Role::Primary => {
+                            ban.ban(PoolError::ServerError, Duration::from_secs(60));
+                        }
+                        Role::Replica => replica_ids.push(pool.id()),
+                        Role::Auto => unreachable!("role auto"),
+                    }
+                }
+
+                assert_eq!(replica_ids.len(), 1, "expected one replica per test shard");
+                replica_ids
+                    .pop()
+                    .expect("test shard should have exactly one replica")
+            })
+            .collect();
+
+        let route = Route::read(ShardWithPriority::new_default_unset(Shard::Multi(vec![
+            0, 1,
+        ])))
+        .with_prefer_primary(true);
+
+        let mut connection = Connection {
+            user: "pgdog".into(),
+            database: "pgdog".into(),
+            cluster: Some(cluster.clone()),
+            ..Default::default()
+        };
+
+        connection
+            .connect(&Request::default(), &route)
+            .await
+            .expect("multi-shard prefer_primary connect should fall back to replicas");
+
+        match &connection.binding {
+            Binding::MultiShard(guards, _) => {
+                let actual_pool_ids: BTreeSet<_> =
+                    guards.iter().map(|guard| guard.pool.id()).collect();
+                assert_eq!(actual_pool_ids, expected_replica_ids);
+            }
+            binding => panic!("expected multi-shard binding, got {binding:?}"),
+        }
+
+        connection.binding.disconnect();
+        cluster.shutdown();
     }
 
     #[tokio::test]

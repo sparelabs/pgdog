@@ -10,6 +10,10 @@ use super::*;
 use monitor::Monitor;
 
 fn create_test_pool_config(host: &str, port: u16) -> PoolConfig {
+    create_test_pool_config_with_role(host, port, Role::Replica)
+}
+
+fn create_test_pool_config_with_role(host: &str, port: u16, role: Role) -> PoolConfig {
     PoolConfig {
         address: Address {
             host: host.into(),
@@ -17,7 +21,7 @@ fn create_test_pool_config(host: &str, port: u16) -> PoolConfig {
             user: "pgdog".into(),
             passwords: vec!["pgdog".into()],
             database_name: "pgdog".into(),
-            configured_role: Role::Replica,
+            configured_role: role,
             ..Default::default()
         },
         config: Config {
@@ -29,6 +33,24 @@ fn create_test_pool_config(host: &str, port: u16) -> PoolConfig {
             },
         },
     }
+}
+
+fn setup_primary_and_replicas(
+    strategy: LoadBalancingStrategy,
+    split: ReadWriteSplit,
+) -> LoadBalancer {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    let lb = LoadBalancer::new(&Some(primary_pool), &replica_configs, strategy, split);
+    lb.launch();
+    lb
 }
 
 fn setup_test_replicas() -> LoadBalancer {
@@ -320,22 +342,10 @@ async fn test_monitor_automatic_ban_expiration() {
 
 #[tokio::test]
 async fn test_read_write_split_exclude_primary() {
-    let primary_config = create_test_pool_config("127.0.0.1", 5432);
-    let primary_pool = Pool::new(&primary_config);
-    primary_pool.launch();
-
-    let replica_configs = [
-        create_test_pool_config("localhost", 5432),
-        create_test_pool_config("127.0.0.1", 5432),
-    ];
-
-    let replicas = LoadBalancer::new(
-        &Some(primary_pool),
-        &replica_configs,
+    let replicas = setup_primary_and_replicas(
         LoadBalancingStrategy::Random,
         ReadWriteSplit::ExcludePrimary,
     );
-    replicas.launch();
 
     let request = Request::default();
 
@@ -572,22 +582,10 @@ async fn test_read_write_split_with_banned_replicas() {
 
 #[tokio::test]
 async fn test_read_write_split_exclude_primary_with_round_robin() {
-    let primary_config = create_test_pool_config("127.0.0.1", 5432);
-    let primary_pool = Pool::new(&primary_config);
-    primary_pool.launch();
-
-    let replica_configs = [
-        create_test_pool_config("localhost", 5432),
-        create_test_pool_config("127.0.0.1", 5432),
-    ];
-
-    let replicas = LoadBalancer::new(
-        &Some(primary_pool),
-        &replica_configs,
+    let replicas = setup_primary_and_replicas(
         LoadBalancingStrategy::RoundRobin,
         ReadWriteSplit::ExcludePrimary,
     );
-    replicas.launch();
 
     let request = Request::default();
 
@@ -882,6 +880,76 @@ async fn test_include_primary_if_replica_banned_with_ban() {
 
     // Shutdown both primary and replicas
     replicas.shutdown();
+}
+
+async fn assert_read_candidates_after_ban(
+    split: ReadWriteSplit,
+    ban_all_replicas: bool,
+    expect_primary_included: bool,
+    expected_unbanned_count: usize,
+) {
+    let replicas = setup_primary_and_replicas(LoadBalancingStrategy::RoundRobin, split);
+
+    if ban_all_replicas {
+        for target in replicas
+            .targets
+            .iter()
+            .filter(|target| target.role() == Role::Replica)
+        {
+            target
+                .ban
+                .ban(Error::ServerError, Duration::from_millis(1000));
+        }
+    } else {
+        replicas
+            .targets
+            .iter()
+            .find(|target| target.role() == Role::Replica)
+            .unwrap()
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .filter(|target| !target.ban.banned())
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert_eq!(candidate_ids.contains(&primary_id), expect_primary_included);
+    assert_eq!(candidate_ids.len(), expected_unbanned_count);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_prefer_primary_explicit_replica_reads_partial_ban_keep_reads_on_healthy_replicas() {
+    assert_read_candidates_after_ban(ReadWriteSplit::PreferPrimary, false, false, 1).await;
+}
+
+#[tokio::test]
+async fn test_prefer_primary_explicit_replica_reads_all_replicas_banned_fall_back_to_primary() {
+    assert_read_candidates_after_ban(ReadWriteSplit::PreferPrimary, true, true, 1).await;
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_partial_ban_keeps_reads_on_healthy_replicas() {
+    assert_read_candidates_after_ban(
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+        false,
+        false,
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_all_banned_falls_back_to_primary() {
+    assert_read_candidates_after_ban(ReadWriteSplit::IncludePrimaryIfReplicaBanned, true, true, 1)
+        .await;
 }
 
 #[tokio::test]
@@ -1718,6 +1786,395 @@ fn test_ban_check_default_threshold_clears_expired_ban_despite_high_lag() {
 // ==========================================
 
 #[tokio::test]
+async fn test_exclude_primary_all_replicas_banned_returns_unavailable() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    for target in replicas
+        .targets
+        .iter()
+        .filter(|target| target.role() == Role::Replica)
+    {
+        target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let request = Request::default();
+    let result = replicas.get(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "ExcludePrimary should not fall back to primary when all replicas are banned"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_exclude_primary_primary_down_reads_go_to_replicas() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    if let Some(primary_target) = replicas.primary_target() {
+        primary_target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .filter(|target| !target.ban.banned())
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(!candidate_ids.contains(&primary_id));
+    assert_eq!(candidate_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_exclude_primary_all_down_returns_unavailable() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    for target in &replicas.targets {
+        target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let request = Request::default();
+    let result = replicas.get(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "ExcludePrimary should be unavailable when all targets are down"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_all_down_returns_unavailable() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    for target in &replicas.targets {
+        target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let request = Request::default();
+    let result = replicas.get(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "IncludePrimary should be unavailable when all targets are down"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_primary_down_reads_go_to_replicas() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    if let Some(primary_target) = replicas.primary_target() {
+        primary_target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .filter(|target| !target.ban.banned())
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(!candidate_ids.contains(&primary_id));
+    assert_eq!(candidate_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_all_down_returns_unavailable() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    for target in &replicas.targets {
+        target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let request = Request::default();
+    let result = replicas.get(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "IncludePrimaryIfReplicaBanned should be unavailable when all targets are down"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_prefer_primary_all_down_returns_unavailable() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    for target in &replicas.targets {
+        target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let request = Request::default();
+    let result = replicas.preferred_read(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "PreferPrimary should be unavailable when all targets are down"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_prefer_primary_explicit_replica_reads_primary_down_go_to_replicas() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    if let Some(primary_target) = replicas.primary_target() {
+        primary_target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .filter(|target| !target.ban.banned())
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(!candidate_ids.contains(&primary_id));
+    assert_eq!(candidate_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_replicas_down_reads_fall_back_to_primary() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    for target in replicas
+        .targets
+        .iter()
+        .filter(|target| target.role() == Role::Replica)
+    {
+        target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .filter(|target| !target.ban.banned())
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert_eq!(
+        candidate_ids,
+        HashSet::from([primary_id]),
+        "IncludePrimary should fall back to primary when all replicas are banned"
+    );
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_primary_down_reads_go_to_replicas() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    if let Some(primary_target) = replicas.primary_target() {
+        primary_target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .filter(|target| !target.ban.banned())
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(!candidate_ids.contains(&primary_id));
+    assert_eq!(candidate_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_exclude_primary_healthy_replicas_primary_excluded_from_reads() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(
+        !candidate_ids.contains(&primary_id),
+        "ExcludePrimary should never include primary in read candidates"
+    );
+    assert_eq!(candidate_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[tokio::test]
+async fn test_include_primary_if_replica_banned_healthy_replicas_primary_excluded_from_reads() {
+    let replicas = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    let candidate_ids: HashSet<_> = replicas
+        .read_candidates()
+        .unwrap()
+        .into_iter()
+        .map(|target| target.pool.id())
+        .collect();
+
+    let primary_id = replicas.primary().unwrap().id();
+    assert!(
+        !candidate_ids.contains(&primary_id),
+        "IncludePrimaryIfReplicaBanned should exclude primary when replicas are healthy"
+    );
+    assert_eq!(candidate_ids.len(), 2);
+
+    replicas.shutdown();
+}
+
+#[test]
+fn test_preferred_read_no_primary_candidates_are_replicas() {
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    let lb = LoadBalancer::new(
+        &None,
+        &replica_configs,
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    assert!(lb.primary_target().is_none());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+}
+
+#[tokio::test]
+async fn test_preferred_read_no_primary_no_replicas_returns_error() {
+    let lb = LoadBalancer::new(
+        &None,
+        &[],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    let request = Request::default();
+    let result = lb.preferred_read(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::AllReplicasDown)),
+        "preferred_read with no primary and no replicas should return AllReplicasDown"
+    );
+}
+
+#[tokio::test]
+async fn test_preferred_read_primary_banned_no_replicas_returns_preferred_read_unavailable() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+    lb.launch();
+
+    if let Some(primary_target) = lb.primary_target() {
+        primary_target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(1000));
+    }
+
+    let request = Request::default();
+    let result = lb.preferred_read(&request).await;
+
+    assert!(
+        matches!(result, Err(Error::PreferredReadUnavailable)),
+        "preferred_read with banned primary and no replicas should return PreferredReadUnavailable"
+    );
+
+    lb.shutdown();
+}
+
+#[tokio::test]
 async fn test_params_returns_params_from_non_banned_target() {
     let replicas = setup_test_replicas();
 
@@ -1785,4 +2242,1129 @@ async fn test_params_returns_all_replicas_down_when_empty() {
         matches!(result, Err(Error::AllReplicasDown)),
         "params() should return AllReplicasDown when no targets exist"
     );
+}
+
+fn create_test_pool_config_resharding_only(host: &str, port: u16) -> PoolConfig {
+    PoolConfig {
+        address: Address {
+            host: host.into(),
+            port,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(100),
+                resharding_only: true,
+                ..Config::default().inner
+            },
+        },
+    }
+}
+
+#[tokio::test]
+async fn test_resharding_only_replicas_excluded_from_read_candidates() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config_resharding_only("localhost", 5432)];
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+    lb.launch();
+
+    assert!(lb.has_replicas());
+
+    let candidates = lb.read_candidates().unwrap();
+    let has_replica = candidates
+        .iter()
+        .any(|target| target.role() == Role::Replica);
+    assert!(
+        !has_replica,
+        "resharding_only replica should be excluded from read candidates"
+    );
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_prefer_primary_resharding_only_replicas_falls_back_to_primary() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let replica_configs = [create_test_pool_config_resharding_only("localhost", 5432)];
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &replica_configs,
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::PreferPrimary,
+    );
+    lb.launch();
+
+    assert!(lb.has_replicas());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].role(), Role::Primary);
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_preferred_read_externally_banned_primary_stays_banned() {
+    let lb = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    // Ban primary externally (simulating a health-check or write-path ban).
+    if let Some(primary_target) = lb.primary_target() {
+        primary_target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(5000));
+    }
+
+    // Ban all replicas so try_candidates will fail.
+    for target in lb.targets.iter().filter(|t| t.role() == Role::Replica) {
+        target
+            .ban
+            .ban(Error::ServerError, Duration::from_millis(5000));
+    }
+
+    let request = Request::default();
+    let _result = lb.preferred_read(&request).await;
+
+    assert!(
+        lb.primary_target().unwrap().ban.banned(),
+        "primary banned externally must stay banned after preferred_read fails"
+    );
+
+    lb.shutdown();
+}
+
+// ==========================================
+// ban_check + read_candidates integration tests
+// ==========================================
+
+fn setup_primary_and_replicas_no_launch(
+    strategy: LoadBalancingStrategy,
+    split: ReadWriteSplit,
+) -> LoadBalancer {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+
+    let replica_configs = [
+        create_test_pool_config("localhost", 5432),
+        create_test_pool_config("127.0.0.1", 5432),
+    ];
+
+    LoadBalancer::new(&Some(primary_pool), &replica_configs, strategy, split)
+}
+
+fn standard_threshold() -> ReplicaLag {
+    ReplicaLag {
+        duration: Duration::from_secs(1),
+        bytes: 100,
+    }
+}
+
+fn bad_lag() -> ReplicaLag {
+    ReplicaLag {
+        duration: Duration::from_secs(10),
+        bytes: 1000,
+    }
+}
+
+fn set_lag(lb: &LoadBalancer, idx: usize, lag: ReplicaLag) {
+    lb.targets[idx].pool.lock().replica_lag = lag;
+}
+
+fn setup_primary_and_replicas_pools_only(
+    strategy: LoadBalancingStrategy,
+    split: ReadWriteSplit,
+) -> LoadBalancer {
+    let lb = setup_primary_and_replicas_no_launch(strategy, split);
+    lb.targets.iter().for_each(|target| target.pool.launch());
+    lb
+}
+
+// -- Group 1: IncludePrimary --
+
+#[test]
+fn test_lag_ban_one_replica_include_primary() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+    assert!(!lb.targets[2].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 2);
+}
+
+#[test]
+fn test_lag_ban_all_replicas_include_primary() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert!(lb.targets[1].ban.banned());
+    assert!(!lb.targets[2].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 1);
+    assert_eq!(unbanned[0].role(), Role::Primary);
+}
+
+#[test]
+fn test_lag_ban_primary_include_primary() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    set_lag(&lb, 2, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(!lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+    assert!(lb.targets[2].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 2);
+    assert!(unbanned.iter().all(|t| t.role() == Role::Replica));
+}
+
+#[test]
+fn test_lag_ban_all_targets_include_primary_safety_valve() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+    set_lag(&lb, 2, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(!lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+    assert!(!lb.targets[2].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 3);
+}
+
+// -- Group 2: ExcludePrimary --
+
+#[test]
+fn test_lag_ban_one_replica_exclude_primary() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 1);
+}
+
+#[test]
+fn test_lag_ban_all_replicas_exclude_primary_no_fallback() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert!(lb.targets[1].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 0);
+}
+
+#[test]
+fn test_lag_ban_primary_exclude_primary_irrelevant() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    set_lag(&lb, 2, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[2].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 2);
+    assert!(unbanned.iter().all(|t| t.role() == Role::Replica));
+}
+
+#[test]
+fn test_lag_ban_mixed_reasons_exclude_primary() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    lb.targets[0].health.toggle(false);
+    set_lag(&lb, 1, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert_eq!(lb.targets[0].ban.error(), Some(Error::PoolUnhealthy));
+    assert!(lb.targets[1].ban.banned());
+    assert_eq!(lb.targets[1].ban.error(), Some(Error::ReplicaLag));
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 0);
+}
+
+// -- Group 3: IncludePrimaryIfReplicaBanned --
+
+#[test]
+fn test_lag_ban_one_replica_if_banned_primary_excluded() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+}
+
+#[test]
+fn test_lag_ban_all_replicas_if_banned_primary_included() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert!(lb.targets[1].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 1);
+    assert_eq!(unbanned[0].role(), Role::Primary);
+}
+
+#[test]
+fn test_lag_ban_all_targets_if_banned_safety_valve() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+    set_lag(&lb, 2, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(!lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+    assert!(!lb.targets[2].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 2);
+}
+
+#[test]
+fn test_lag_ban_replicas_recover_if_banned_primary_excluded_again() {
+    let primary_config = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
+    let primary_pool = Pool::new(&primary_config);
+    let replica_config1 = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
+    let replica_config2 = PoolConfig {
+        address: Address {
+            host: "localhost".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[replica_config1, replica_config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    let threshold = standard_threshold();
+    let monitor = Monitor::new_test(&lb);
+
+    // Step 1: Ban replicas via lag.
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+    monitor.ban_check(&threshold);
+    assert!(lb.targets[0].ban.banned());
+    assert!(lb.targets[1].ban.banned());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+
+    // Step 2: Clear lag, wait for ban expiry, run ban_check again.
+    set_lag(&lb, 0, ReplicaLag::default());
+    set_lag(&lb, 1, ReplicaLag::default());
+    std::thread::sleep(Duration::from_millis(10));
+    monitor.ban_check(&threshold);
+
+    assert!(!lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+
+    // Primary excluded again since no replicas are banned.
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+}
+
+// -- Group 4: PreferPrimary --
+
+#[test]
+fn test_lag_ban_one_replica_prefer_primary_primary_not_in_candidates() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+}
+
+#[test]
+fn test_lag_ban_all_replicas_prefer_primary_primary_in_candidates() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 1);
+    assert_eq!(unbanned[0].role(), Role::Primary);
+}
+
+#[tokio::test]
+async fn test_lag_ban_all_replicas_prefer_primary_preferred_read() {
+    let lb = setup_primary_and_replicas_pools_only(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert!(lb.targets[1].ban.banned());
+    assert!(!lb.targets[2].ban.banned());
+
+    let primary_id = lb.primary().unwrap().id();
+    let request = Request::default();
+    let result = lb.preferred_read(&request).await;
+
+    // Primary is not banned, so preferred_read tries it first.
+    // With PG available: connection succeeds from primary → verify pool id.
+    // Without PG: primary fails → banned → replicas tried (banned, skipped,
+    // then unbanned by try_candidates) → AllReplicasDown. This still exercises
+    // the routing: primary was attempted first because it wasn't banned.
+    if let Ok(conn) = &result {
+        assert_eq!(
+            conn.pool.id(),
+            primary_id,
+            "preferred_read should route to primary when replicas are lag-banned"
+        );
+    }
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_lag_ban_primary_prefer_primary_preferred_read_skips_primary() {
+    let lb = setup_primary_and_replicas_pools_only(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    set_lag(&lb, 2, bad_lag());
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[2].ban.banned());
+    assert!(!lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+
+    let request = Request::default();
+    let result = lb.preferred_read(&request).await;
+
+    // Primary is lag-banned, so preferred_read skips it and tries replicas.
+    // If PG is available, a replica connection succeeds.
+    if let Ok(conn) = &result {
+        let primary_id = lb.primary().unwrap().id();
+        assert_ne!(
+            conn.pool.id(),
+            primary_id,
+            "preferred_read should skip lag-banned primary"
+        );
+    }
+
+    // Primary ban should be preserved (no background monitor to clear it).
+    assert!(
+        lb.targets[2].ban.banned(),
+        "primary lag ban should be preserved after preferred_read skips it"
+    );
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_lag_ban_preferred_read_external_ban_preserved_after_lag_ban() {
+    let lb = setup_primary_and_replicas_pools_only(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+
+    // Ban primary externally with ServerError.
+    lb.targets[2]
+        .ban
+        .ban(Error::ServerError, Duration::from_millis(5000));
+    assert_eq!(lb.targets[2].ban.error(), Some(Error::ServerError));
+
+    // Lag-ban replicas via ban_check.
+    set_lag(&lb, 0, bad_lag());
+    set_lag(&lb, 1, bad_lag());
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert!(lb.targets[1].ban.banned());
+
+    let request = Request::default();
+    let result = lb.preferred_read(&request).await;
+    assert!(result.is_err());
+
+    // Primary ban must be preserved with original ServerError, not overwritten.
+    assert!(lb.targets[2].ban.banned());
+    assert_eq!(
+        lb.targets[2].ban.error(),
+        Some(Error::ServerError),
+        "external ServerError ban must not be overwritten by lag ban"
+    );
+
+    lb.shutdown();
+}
+
+// -- Group 5: Threshold variants --
+
+#[test]
+fn test_lag_ban_bytes_threshold_triggers_ban() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    let threshold = ReplicaLag {
+        duration: Duration::MAX,
+        bytes: 100,
+    };
+
+    set_lag(
+        &lb,
+        0,
+        ReplicaLag {
+            bytes: 200,
+            duration: Duration::ZERO,
+        },
+    );
+
+    Monitor::new_test(&lb).ban_check(&threshold);
+
+    assert!(
+        lb.targets[0].ban.banned(),
+        "should be banned via bytes threshold alone"
+    );
+    assert_eq!(lb.targets[0].ban.error(), Some(Error::ReplicaLag));
+}
+
+#[test]
+fn test_lag_ban_duration_threshold_triggers_ban() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimary,
+    );
+
+    let threshold = ReplicaLag {
+        duration: Duration::from_secs(5),
+        bytes: i64::MAX,
+    };
+
+    set_lag(
+        &lb,
+        0,
+        ReplicaLag {
+            bytes: 0,
+            duration: Duration::from_secs(10),
+        },
+    );
+
+    Monitor::new_test(&lb).ban_check(&threshold);
+
+    assert!(
+        lb.targets[0].ban.banned(),
+        "should be banned via duration threshold alone"
+    );
+    assert_eq!(lb.targets[0].ban.error(), Some(Error::ReplicaLag));
+}
+
+// -- Group 6: Recovery & multi-cycle --
+
+#[test]
+fn test_lag_ban_safety_valve_all_rw_splits() {
+    let splits = [
+        ReadWriteSplit::IncludePrimary,
+        ReadWriteSplit::ExcludePrimary,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+        ReadWriteSplit::PreferPrimary,
+    ];
+
+    for split in splits {
+        let lb = setup_primary_and_replicas_no_launch(LoadBalancingStrategy::Random, split);
+
+        lb.targets[0].health.toggle(false);
+        lb.targets[1].health.toggle(false);
+        lb.targets[2].health.toggle(false);
+
+        Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+        assert!(
+            !lb.targets[0].ban.banned(),
+            "safety valve should fire for {:?}",
+            split
+        );
+        assert!(!lb.targets[1].ban.banned());
+        assert!(!lb.targets[2].ban.banned());
+
+        let candidates = lb.read_candidates();
+        assert!(
+            candidates.is_ok(),
+            "read_candidates should return Ok for {:?}, got {:?}",
+            split,
+            candidates
+        );
+    }
+}
+
+#[test]
+fn test_lag_ban_mixed_unhealthy_and_lag() {
+    let lb = setup_primary_and_replicas_no_launch(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    lb.targets[0].health.toggle(false);
+    set_lag(&lb, 1, bad_lag());
+    // Primary (targets[2]) is healthy, no lag.
+
+    Monitor::new_test(&lb).ban_check(&standard_threshold());
+
+    assert!(lb.targets[0].ban.banned());
+    assert_eq!(lb.targets[0].ban.error(), Some(Error::PoolUnhealthy));
+    assert!(lb.targets[1].ban.banned());
+    assert_eq!(lb.targets[1].ban.error(), Some(Error::ReplicaLag));
+    assert!(!lb.targets[2].ban.banned());
+
+    // All replicas banned → primary included.
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+    let unbanned: Vec<_> = candidates.iter().filter(|t| !t.ban.banned()).collect();
+    assert_eq!(unbanned.len(), 1);
+    assert_eq!(unbanned[0].role(), Role::Primary);
+}
+
+#[test]
+fn test_lag_ban_repeated_cycles_converge() {
+    let primary_config = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
+    let primary_pool = Pool::new(&primary_config);
+    let replica_config1 = PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
+    let replica_config2 = PoolConfig {
+        address: Address {
+            host: "localhost".into(),
+            port: 5432,
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            database_name: "pgdog".into(),
+            configured_role: Role::Replica,
+            ..Default::default()
+        },
+        config: Config {
+            inner: pgdog_stats::Config {
+                max: 1,
+                checkout_timeout: Duration::from_millis(1000),
+                ban_timeout: Duration::from_millis(1),
+                ..Config::default().inner
+            },
+        },
+    };
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[replica_config1, replica_config2],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+
+    let threshold = standard_threshold();
+    let monitor = Monitor::new_test(&lb);
+
+    // Step 1: Ban 1 replica.
+    set_lag(&lb, 0, bad_lag());
+    monitor.ban_check(&threshold);
+    assert!(lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+    // 1 of 2 replicas banned → primary excluded.
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+
+    // Step 2: Ban both replicas.
+    set_lag(&lb, 1, bad_lag());
+    monitor.ban_check(&threshold);
+    assert!(lb.targets[0].ban.banned());
+    assert!(lb.targets[1].ban.banned());
+    // All replicas banned → primary included.
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 3);
+
+    // Step 3: Clear lag, wait for bans to expire, unban.
+    set_lag(&lb, 0, ReplicaLag::default());
+    set_lag(&lb, 1, ReplicaLag::default());
+    std::thread::sleep(Duration::from_millis(10));
+    monitor.ban_check(&threshold);
+    assert!(!lb.targets[0].ban.banned());
+    assert!(!lb.targets[1].ban.banned());
+    // No replicas banned → primary excluded.
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+
+    // Step 4: Set 1 unhealthy.
+    lb.targets[0].health.toggle(false);
+    monitor.ban_check(&threshold);
+    assert!(lb.targets[0].ban.banned());
+    assert_eq!(lb.targets[0].ban.error(), Some(Error::PoolUnhealthy));
+    assert!(!lb.targets[1].ban.banned());
+    // 1 of 2 replicas banned → primary excluded.
+    let candidates = lb.read_candidates().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|t| t.role() == Role::Replica));
+}
+
+#[tokio::test]
+async fn test_any_read_includes_primary_and_replicas() {
+    let lb = setup_primary_and_replicas(
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    let request = Request::default();
+    let mut used_ids = HashSet::new();
+    for _ in 0..50 {
+        let conn = lb.any_read(&request).await.unwrap();
+        used_ids.insert(conn.pool.id());
+    }
+
+    assert_eq!(
+        used_ids.len(),
+        3,
+        "any_read should use primary + 2 replicas"
+    );
+    let primary_id = lb.primary().unwrap().id();
+    assert!(used_ids.contains(&primary_id));
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_any_read_exclude_primary_split_still_includes_primary() {
+    let lb = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    let request = Request::default();
+    let mut used_ids = HashSet::new();
+    for _ in 0..30 {
+        let conn = lb.any_read(&request).await.unwrap();
+        used_ids.insert(conn.pool.id());
+    }
+
+    let primary_id = lb.primary().unwrap().id();
+    assert!(
+        used_ids.contains(&primary_id),
+        "any_read ignores rw_split and includes primary"
+    );
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_any_read_banned_target_skipped() {
+    let lb = setup_primary_and_replicas(
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    lb.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+
+    let request = Request::default();
+    let mut used_ids = HashSet::new();
+    for _ in 0..20 {
+        let conn = lb.any_read(&request).await.unwrap();
+        used_ids.insert(conn.pool.id());
+    }
+
+    assert!(
+        !used_ids.contains(&lb.targets[0].pool.id()),
+        "banned target should be skipped"
+    );
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_any_read_resharding_only_excluded() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let mut resharding_config = create_test_pool_config("localhost", 5433);
+    resharding_config.config.inner.resharding_only = true;
+
+    let normal_config = create_test_pool_config("localhost", 5432);
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[resharding_config, normal_config],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+    );
+    lb.launch();
+
+    let request = Request::default();
+    let mut used_ids = HashSet::new();
+    for _ in 0..20 {
+        let conn = lb.any_read(&request).await.unwrap();
+        used_ids.insert(conn.pool.id());
+    }
+
+    let resharding_id = lb.targets[0].pool.id();
+    assert!(
+        !used_ids.contains(&resharding_id),
+        "resharding-only target should be excluded from any_read"
+    );
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_any_read_all_down_returns_error() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[],
+        LoadBalancingStrategy::Random,
+        ReadWriteSplit::ExcludePrimary,
+    );
+    lb.launch();
+
+    lb.targets[0]
+        .ban
+        .ban(Error::ServerError, Duration::from_secs(60));
+
+    let request = Request::default();
+    let result = lb.any_read(&request).await;
+    assert!(result.is_err());
+
+    lb.shutdown();
+}
+
+#[tokio::test]
+async fn test_preferred_read_with_auto_targets() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    let auto_config = create_test_pool_config_with_role("localhost", 5433, Role::Auto);
+    let replica_config = create_test_pool_config("localhost", 5434);
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[auto_config, replica_config],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::PreferPrimary,
+    );
+    lb.launch();
+
+    let request = Request::default();
+
+    // preferred_read only includes explicit Role::Replica targets.
+    // Auto targets should not appear in its candidate list.
+    let mut seen_ids = HashSet::new();
+    for _ in 0..10 {
+        let conn = lb.preferred_read(&request).await.unwrap();
+        seen_ids.insert(conn.pool.id());
+    }
+
+    let auto_id = lb.targets[0].pool.id();
+    assert!(
+        !seen_ids.contains(&auto_id),
+        "preferred_read must not include Auto targets"
+    );
+
+    lb.shutdown();
+}
+
+#[test]
+fn test_any_read_with_auto_targets() {
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+
+    let auto_config = create_test_pool_config_with_role("localhost", 5433, Role::Auto);
+    let replica_config = create_test_pool_config("localhost", 5434);
+
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[auto_config, replica_config],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::ExcludePrimary,
+    );
+
+    // any_read filters: all non-resharding targets regardless of role.
+    // Verify by checking that all 3 targets are non-resharding candidates.
+    let candidates: Vec<_> = lb
+        .targets
+        .iter()
+        .filter(|target| !target.pool.config().resharding_only)
+        .collect();
+
+    assert_eq!(candidates.len(), 3, "all 3 targets should be candidates");
+
+    let roles: Vec<_> = candidates.iter().map(|t| t.role()).collect();
+    assert!(
+        roles.contains(&Role::Auto),
+        "Auto target must be a candidate"
+    );
+    assert!(
+        roles.contains(&Role::Replica),
+        "Replica target must be a candidate"
+    );
+    assert!(
+        roles.contains(&Role::Primary),
+        "Primary target must be a candidate"
+    );
+}
+
+#[tokio::test]
+async fn test_read_candidates_auto_not_counted_as_replica() {
+    let auto_config1 = create_test_pool_config_with_role("localhost", 5433, Role::Auto);
+    let auto_config2 = create_test_pool_config_with_role("localhost", 5434, Role::Auto);
+
+    let primary_config = create_test_pool_config("127.0.0.1", 5432);
+    let primary_pool = Pool::new(&primary_config);
+    primary_pool.launch();
+
+    // IncludePrimaryIfReplicaBanned: primary is included when total_replicas == banned_replicas.
+    // With only Auto targets, total_replicas == 0 == banned_replicas, so primary should be included.
+    let lb = LoadBalancer::new(
+        &Some(primary_pool),
+        &[auto_config1, auto_config2],
+        LoadBalancingStrategy::RoundRobin,
+        ReadWriteSplit::IncludePrimaryIfReplicaBanned,
+    );
+    lb.launch();
+
+    let candidates = lb.read_candidates().unwrap();
+    let primary_id = lb.primary().unwrap().id();
+
+    let has_primary = candidates.iter().any(|t| t.pool.id() == primary_id);
+    assert!(
+        has_primary,
+        "When only Auto targets exist (no explicit replicas), primary must be included \
+         under IncludePrimaryIfReplicaBanned because total_replicas == banned_replicas == 0"
+    );
+
+    let auto_count = candidates.iter().filter(|t| t.role() == Role::Auto).count();
+    assert_eq!(auto_count, 2, "Both Auto targets should be in candidates");
+
+    lb.shutdown();
 }

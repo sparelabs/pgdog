@@ -2,7 +2,6 @@
 
 use std::os::raw::c_void;
 
-use pgdog_config::Role;
 use pgdog_plugin::pg_query::protobuf::ParseResult;
 use pgdog_plugin::{PdParameters, PdRouterContext, PdStatement};
 
@@ -11,7 +10,7 @@ use crate::frontend::router::parser::ShardsWithPriority;
 use crate::net::Bind;
 use crate::{
     backend::ShardingSchema,
-    config::{MultiTenant, ReadWriteStrategy},
+    config::{MultiTenant, ReadWriteSplit, ReadWriteStrategy},
     frontend::{BufferedQuery, RouterContext},
 };
 
@@ -35,6 +34,8 @@ pub struct QueryParserContext<'a> {
     pub(super) router_context: RouterContext<'a>,
     /// How aggressively we want to send reads to replicas.
     pub(super) rw_strategy: &'a ReadWriteStrategy,
+    /// How reads are split between primary and replicas.
+    pub(super) rw_split: ReadWriteSplit,
     /// Do we need the router at all? Shortcut to bypass this for unsharded
     /// clusters with databases that only read or write.
     pub(super) router_needed: bool,
@@ -64,6 +65,7 @@ impl<'a> QueryParserContext<'a> {
             shards: router_context.cluster.shards().len(),
             sharding_schema,
             rw_strategy: router_context.cluster.read_write_strategy(),
+            rw_split: router_context.cluster.read_write_split(),
             router_needed: router_context.cluster.router_needed(),
             multi_tenant: router_context.cluster.multi_tenant(),
             dry_run: router_context.cluster.dry_run(),
@@ -74,12 +76,16 @@ impl<'a> QueryParserContext<'a> {
     }
 
     /// Write override enabled?
+    ///
+    /// This is purely statement-level: it indicates the query is likely
+    /// to write data (e.g. conservative strategy inside a read-write
+    /// transaction).  Connection-level role and config-level
+    /// prefer_primary are applied later in `QueryParser::parse()`.
     pub(super) fn write_override(&self) -> bool {
         matches!(
             self.router_context.transaction(),
             Some(TransactionType::ReadWrite)
         ) && self.rw_conservative()
-            || self.router_context.parameter_hints.compute_role() == Some(Role::Primary)
     }
 
     /// Are we using the conservative read/write separation strategy?

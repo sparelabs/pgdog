@@ -430,4 +430,32 @@ mod test {
         let roundtrip = Startup::from_stream(&mut read).await.unwrap();
         assert_eq!(roundtrip, cancel);
     }
+
+    #[tokio::test]
+    async fn test_startup_options_parses_pgdog_role() {
+        let (mut write, mut read) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            let mut body = BytesMut::new();
+            body.put_i32(196608);
+            body.put_slice(b"user\0postgres\0");
+            body.put_slice(b"options\0-c pgdog.role=prefer-replica\0");
+            body.put_u8(0);
+
+            let mut buf = BytesMut::new();
+            buf.put_i32(4 + body.len() as i32);
+            buf.put(body);
+            write.write_all(&buf).await.unwrap();
+        });
+
+        let startup = Startup::from_stream(&mut read).await.unwrap();
+        match startup {
+            Startup::Startup { params, .. } => {
+                assert_eq!(
+                    params.get("pgdog.role").unwrap(),
+                    &ParameterValue::String("prefer-replica".into()),
+                );
+            }
+            _ => panic!("expected Startup"),
+        }
+    }
 }

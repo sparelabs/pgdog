@@ -232,13 +232,31 @@ mod test {
         );
     }
 
-    #[tokio::test]
+    /// Kill stale sessions from previous failed runs whose locks would
+    /// block DDL on the `pgdog` schema.
+    async fn cleanup_test_mirror_sessions(conn: &mut super::super::Guard) {
+        let _ = conn
+            .execute(
+                "SELECT pg_terminate_backend(pid) \
+                 FROM pg_stat_activity \
+                 WHERE pid != pg_backend_pid() \
+                   AND state != 'idle' \
+                   AND xact_start < NOW() - INTERVAL '10 seconds'",
+            )
+            .await;
+        sleep(Duration::from_millis(100)).await;
+        let _ = conn.execute("DROP TABLE IF EXISTS pgdog.test_mirror").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_mirror() {
         config::load_test();
         let cluster = Cluster::new_test(&config());
         cluster.launch();
-        let mut mirror = Mirror::spawn("pgdog", &cluster, None).unwrap();
         let mut conn = cluster.primary(0, &Request::default()).await.unwrap();
+        cleanup_test_mirror_sessions(&mut conn).await;
+
+        let mut mirror = Mirror::spawn("pgdog", &cluster, None).unwrap();
 
         for _ in 0..3 {
             assert!(
@@ -253,7 +271,7 @@ mod test {
                     ]
                     .into()
                 ),
-                "mirror didn't send SELECT 1"
+                "mirror didn't send CREATE TABLE"
             );
             assert!(
                 mirror.send(&vec![Query::new("COMMIT").into()].into()),
@@ -271,11 +289,16 @@ mod test {
                 "table pgdog.test_mirror shouldn't exist yet"
             );
             assert!(mirror.flush(), "mirror didn't flush");
-            sleep(Duration::from_millis(50)).await;
-            assert!(
-                conn.execute("DROP TABLE pgdog.test_mirror").await.is_ok(),
-                "pgdog.test_mirror should exist"
-            );
+            // Mirror flush is async — poll until the table exists.
+            let mut found = false;
+            for _ in 0..20 {
+                sleep(Duration::from_millis(250)).await;
+                if conn.execute("DROP TABLE pgdog.test_mirror").await.is_ok() {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "pgdog.test_mirror should exist");
             assert!(mirror.buffer().is_empty(), "mirror buffer should be empty");
         }
 

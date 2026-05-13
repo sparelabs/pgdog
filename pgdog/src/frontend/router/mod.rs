@@ -20,7 +20,7 @@ use crate::frontend::router::parser::ShardWithPriority;
 
 use super::ClientRequest;
 pub use context::RouterContext;
-pub use parameter_hints::ParameterHints;
+pub use parameter_hints::{ParameterHints, RoleHint};
 pub use search_path::SearchPath;
 pub use sharding::{Lists, Ranges};
 

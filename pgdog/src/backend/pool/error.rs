@@ -56,6 +56,9 @@ pub enum Error {
     #[error("all replicas down")]
     AllReplicasDown,
 
+    #[error("preferred read unavailable")]
+    PreferredReadUnavailable,
+
     #[error("router error")]
     Router,
 

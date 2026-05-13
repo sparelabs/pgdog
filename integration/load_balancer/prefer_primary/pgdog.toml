@@ -1,0 +1,53 @@
+[general]
+host = "0.0.0.0"
+port = 6432
+shutdown_timeout = 5_000
+openmetrics_port = 9090
+query_timeout = 15_000
+checkout_timeout = 5_000
+connect_timeout = 5_000
+idle_timeout = 30_000
+prepared_statements = "extended"
+passthrough_auth = "enabled_plain"
+default_pool_size = 90
+workers = 10
+min_pool_size = 1
+pooler_mode = "transaction"
+load_balancing_strategy = "round_robin"
+auth_type = "trust"
+read_write_split = "prefer_primary"
+expanded_explain = true
+lsn_check_delay = 0
+
+[rewrite]
+enabled = false
+shard_key = "ignore"
+split_inserts = "error"
+
+[admin]
+user = "pgdog"
+password = "pgdog"
+
+[[databases]]
+name = "postgres"
+host = "localhost"
+role = "primary"
+port = 45000
+
+[[databases]]
+name = "postgres"
+host = "localhost"
+port = 45001
+role = "replica"
+
+[[databases]]
+name = "postgres"
+host = "localhost"
+role = "replica"
+port = 45002
+
+[tcp]
+retries = 3
+time = 1000
+interval = 1000
+user_timeout = 1000

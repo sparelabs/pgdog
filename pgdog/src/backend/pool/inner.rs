@@ -30,6 +30,8 @@ pub(super) struct Inner {
     pub(super) online: bool,
     /// Pool is paused.
     pub(super) paused: bool,
+    /// Pool is draining — connections returned here are closed, not recycled.
+    pub(super) draining: bool,
     /// Track out of sync terminations.
     pub(super) out_of_sync: usize,
     /// How many times servers had to be re-synced
@@ -60,6 +62,7 @@ impl std::fmt::Debug for Inner {
             .field("idle_connections", &self.idle_connections.len())
             .field("waiting", &self.waiting.len())
             .field("online", &self.online)
+            .field("draining", &self.draining)
             .finish()
     }
 }
@@ -74,6 +77,7 @@ impl Inner {
             waiting: VecDeque::new(),
             online: false,
             paused: false,
+            draining: false,
             force_close: 0,
             out_of_sync: 0,
             re_synced: 0,
@@ -163,7 +167,7 @@ impl Inner {
         // unless it's a primary.
         let reason = if client_needs {
             ConnectReason::ClientWaiting
-        } else if maintenance_on && maintain_min {
+        } else if maintenance_on && maintain_min && !self.draining {
             ConnectReason::BelowMin
         } else {
             return ShouldCreate::No;
@@ -276,8 +280,8 @@ impl Inner {
     }
 
     #[inline]
-    pub(super) fn set_taken(&mut self, taken: Taken) {
-        self.taken = taken;
+    pub(super) fn merge_taken(&mut self, taken: Taken) {
+        self.taken.merge(taken);
     }
 
     /// Dump all idle connections.
@@ -347,8 +351,8 @@ impl Inner {
             return Ok(result);
         }
 
-        // Pool is offline or paused, connection should be closed.
-        if !self.online && !moving || self.paused {
+        // Pool is offline, paused, or draining — connection should be closed.
+        if !self.online && !moving || self.paused || self.draining {
             result.replenish = false;
             return Ok(result);
         }
@@ -537,6 +541,36 @@ mod test {
             .unwrap();
 
         assert_eq!(inner.total(), 0); // pool paused, connection not added
+    }
+
+    #[test]
+    fn test_draining_pool_behavior() {
+        let mut inner = Inner {
+            online: true,
+            draining: true,
+            ..Default::default()
+        };
+        inner.config.min = 2;
+        inner.config.max = 5;
+
+        let server = Box::new(Server::default());
+        let server_id = *server.id();
+        inner
+            .taken
+            .take(&Mapping {
+                client: BackendKeyData::new(),
+                server: server_id,
+            })
+            .unwrap();
+
+        inner
+            .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
+            .unwrap();
+
+        assert_eq!(inner.idle(), 0);
+        assert_eq!(inner.total(), 0);
+
+        assert_eq!(inner.should_create(), ShouldCreate::No);
     }
 
     #[test]
@@ -1020,7 +1054,7 @@ mod test {
     }
 
     #[test]
-    fn test_set_taken() {
+    fn test_merge_taken() {
         let mut inner = Inner::default();
         let mapping = Mapping {
             client: BackendKeyData::new(),
@@ -1032,7 +1066,7 @@ mod test {
         let mut taken = Taken::default();
         taken.take(&mapping).unwrap();
 
-        inner.set_taken(taken);
+        inner.merge_taken(taken);
         assert_eq!(inner.checked_out(), 1);
     }
 

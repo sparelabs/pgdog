@@ -1,6 +1,6 @@
 //! Connection pool.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,7 @@ pub(crate) struct InnerSync {
     pub(super) health: TargetHealth,
     pub(super) params: OnceCell<Parameters>,
     pub(super) lsn_stats: RwLock<LsnStats>,
+    pub(super) checked_out_count: AtomicUsize,
 }
 
 impl std::fmt::Debug for Pool {
@@ -69,6 +70,7 @@ impl Pool {
                 health: TargetHealth::new(id),
                 params: OnceCell::new(),
                 lsn_stats: RwLock::new(LsnStats::default()),
+                checked_out_count: AtomicUsize::new(0),
             }),
         }
     }
@@ -90,6 +92,11 @@ impl Pool {
 
     pub fn healthy(&self) -> bool {
         self.inner.health.healthy()
+    }
+
+    /// Lock-free approximate count of checked-out connections.
+    pub fn checked_out_count(&self) -> usize {
+        self.inner.checked_out_count.load(Ordering::Relaxed)
     }
 
     /// Launch the maintenance loop, bringing the pool online.
@@ -136,6 +143,7 @@ impl Pool {
                 let conn = guard.take(request)?;
 
                 if conn.is_some() {
+                    self.inner.checked_out_count.fetch_add(1, Ordering::Release);
                     guard.stats.counts.wait_time += elapsed;
                     guard.stats.counts.server_assignment_count += 1;
                     if request.read {
@@ -248,7 +256,21 @@ impl Pool {
         let CheckInResult {
             server_error,
             replenish,
-        } = { self.lock().maybe_check_in(server, now, counts, false)? };
+        } = {
+            let mut guard = self.lock();
+            let before = guard.checked_out();
+            let result = guard.maybe_check_in(server, now, counts, false)?;
+            let after = guard.checked_out();
+            if before > after {
+                let delta = before - after;
+                let _ = self.inner.checked_out_count.fetch_update(
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                    |n| Some(n.saturating_sub(delta)),
+                );
+            }
+            result
+        };
 
         if server_error {
             error!(
@@ -306,12 +328,30 @@ impl Pool {
             let mut from_guard = self.lock();
             let mut to_guard = destination.lock();
 
+            let from_before = from_guard.checked_out();
+            let to_before = to_guard.checked_out();
+
             from_guard.online = false;
             let (idle, taken) = from_guard.move_conns_to(destination);
             for server in idle {
                 to_guard.put(server, now)?;
             }
-            to_guard.set_taken(taken);
+            to_guard.merge_taken(taken);
+
+            let from_after = from_guard.checked_out();
+            let to_after = to_guard.checked_out();
+
+            if from_before > from_after {
+                self.inner
+                    .checked_out_count
+                    .fetch_sub(from_before - from_after, Ordering::Release);
+            }
+            if to_after > to_before {
+                destination
+                    .inner
+                    .checked_out_count
+                    .fetch_add(to_after - to_before, Ordering::Release);
+            }
         }
 
         self.shutdown();
@@ -379,6 +419,13 @@ impl Pool {
         guard.close_waiters(Error::Offline);
         self.comms().shutdown.notify_waiters();
         self.comms().ready.notify_waiters();
+    }
+
+    /// Begin draining: dump idle connections and close any returned from now on.
+    pub fn drain(&self) {
+        let mut guard = self.lock();
+        guard.draining = true;
+        guard.dump_idle();
     }
 
     /// Pool exclusive lock.

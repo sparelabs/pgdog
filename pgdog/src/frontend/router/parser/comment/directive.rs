@@ -2,8 +2,10 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::backend::ShardingSchema;
-use crate::config::database::Role;
+use crate::frontend::router::parameter_hints::RoleHint;
 use crate::frontend::router::sharding::ContextBuilder;
+
+use tracing::warn;
 
 use super::super::Error;
 use super::super::Shard;
@@ -13,8 +15,9 @@ pub(super) static SHARD: Lazy<Regex> =
 pub(super) static SHARDING_KEY: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"pgdog_sharding_key: *(?:"([^"]*)"|'([^']*)'|([0-9a-zA-Z-]+))"#).unwrap()
 });
-pub(super) static ROLE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"pgdog_role: *(primary|replica)"#).unwrap());
+pub(super) static ROLE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"pgdog_role: *(prefer[-_]primary|prefer[-_]replica|primary|replica|any)"#).unwrap()
+});
 
 pub(super) fn get_matched_value<'a>(caps: &'a regex::Captures<'a>) -> Option<&'a str> {
     caps.get(1)
@@ -26,16 +29,12 @@ pub(super) fn get_matched_value<'a>(caps: &'a regex::Captures<'a>) -> Option<&'a
 pub(super) fn shard_role_from_comment(
     comment: &str,
     schema: &ShardingSchema,
-) -> Result<(Option<Shard>, Option<Role>), Error> {
+) -> Result<(Option<Shard>, Option<RoleHint>), Error> {
     let mut role = None;
 
     if let Some(cap) = ROLE.captures(comment) {
         if let Some(r) = cap.get(1) {
-            match r.as_str() {
-                "primary" => role = Some(Role::Primary),
-                "replica" => role = Some(Role::Replica),
-                _ => return Err(Error::RegexError),
-            }
+            role = r.as_str().parse::<RoleHint>().ok();
         }
     }
     if let Some(cap) = SHARDING_KEY.captures(comment) {
@@ -51,17 +50,19 @@ pub(super) fn shard_role_from_comment(
     }
     if let Some(cap) = SHARD.captures(comment) {
         if let Some(shard) = cap.get(1) {
-            return Ok((
-                Some(
-                    shard
-                        .as_str()
-                        .parse::<usize>()
-                        .ok()
-                        .map(Shard::Direct)
-                        .unwrap_or(Shard::All),
-                ),
-                role,
-            ));
+            let parsed = shard.as_str().parse::<usize>();
+            let shard_value = match parsed {
+                Ok(n) => Shard::Direct(n),
+                Err(e) => {
+                    warn!(
+                        "pgdog_shard {:?} parse failed ({}); broadcasting to all shards",
+                        shard.as_str(),
+                        e
+                    );
+                    Shard::All
+                }
+            };
+            return Ok((Some(shard_value), role));
         }
     }
 
