@@ -565,9 +565,6 @@ impl Client {
         let mut offline = shutdown.is_cancelled();
         let mut shutdown_signal = pin!(shutdown.cancelled());
 
-        let mut cluster_reloads = query_engine.cluster_reloads();
-        let mut admin_termination = pin!(query_engine.cancellation_token().cancelled_owned());
-
         loop {
             // If query engine is idle and we requested shutdown, we're done.
             // Admin clients stay connected, so admin commands work during shutdown.
@@ -579,23 +576,16 @@ impl Client {
                 break;
             }
 
-            if query_engine.cluster_reloads() != cluster_reloads {
-                cluster_reloads = query_engine.cluster_reloads();
-                admin_termination.set(query_engine.cancellation_token().cancelled_owned());
-            }
-
             let client_state = query_engine.client_state();
+            let admin_termination = query_engine.cancellation_token().cancelled_owned();
 
             select! {
                 _ = &mut shutdown_signal, if !offline => {
                     offline = true;
                 }
 
-                // If any of the `CancellationTokens `trigger, exit early. Currently used for admin `FORCE_RELOAD`.
-                // If this returns an Error, it'll be propagated up to `Client`'s [`Box::pin(self.run())`]
-                // which will disconnect the `Client` (and `QueryEngine` transactions)
-                _ = &mut admin_termination => {
-                    return Err(Error::AdminTermination);
+                _ = admin_termination => {
+                    query_engine.rebind_after_force_reload(self.in_transaction()).await?;
                 }
 
                 // Async messages.
@@ -650,20 +640,35 @@ impl Client {
     ///
     /// * `query_engine`: Query engine to set the client state into `waiting`.
     ///
-    async fn check_maintenance_mode(&self, query_engine: &mut QueryEngine) {
+    async fn check_maintenance_mode(&self, query_engine: &mut QueryEngine) -> Result<(), Error> {
         if !self.in_transaction()
             && !self.admin
             && let Some(waiter) = maintenance_mode::waiter(&self.database)
         {
+            let cancellation = query_engine.cancellation_token();
+            let interrupt = !query_engine.can_rebind_after_force_reload();
             let _guard = query_engine.set_maintenance_mode();
-            waiter.await;
+            select! {
+                biased;
+                _ = cancellation.cancelled(), if interrupt => return Err(Error::AdminTermination),
+                _ = waiter => {}
+            }
         }
+        Ok(())
     }
 
     /// Handle client messages.
     async fn client_messages(&mut self, query_engine: &mut QueryEngine) -> Result<(), Error> {
         use query_engine::{Pipeline, QueryEngineContext, QueryEngineResult};
-        self.check_maintenance_mode(query_engine).await;
+        loop {
+            self.check_maintenance_mode(query_engine).await?;
+            if !query_engine.cancellation_token().is_cancelled() {
+                break;
+            }
+            query_engine
+                .rebind_after_force_reload(self.in_transaction())
+                .await?;
+        }
 
         let (mut context, client_request) = QueryEngineContext::new(self);
         match query_engine.handle(&mut context, client_request).await? {
@@ -701,6 +706,7 @@ impl Client {
             }
         }
 
+        self.client_request.clear();
         // Check buffer size once per request.
         self.stream_buffer.shrink_to_fit();
 
@@ -712,19 +718,18 @@ impl Client {
     /// This ensures we don't check out a connection from the pool until the client
     /// sent a complete request.
     async fn buffer(&mut self, state: State) -> Result<BufferEvent, Error> {
-        self.client_request.clear();
+        // Another event can interrupt this future between messages. Keep the
+        // request and its configuration until the complete batch is handled.
+        if self.client_request.messages.is_empty() {
+            let config = config::config();
+            self.prepared_statements.level = config.prepared_statements();
+            self.timeouts = Timeouts::from_config(&config.config.general);
+            self.query_log_stdout = config.config.general.query_log_stdout;
+            self.query_size_limit = config.config.general.query_size_limit;
+            self.stream_buffer
+                .set_size_limit_block(config.config.general.frontend_query_size_limit_block());
+        }
 
-        // Check config once per request.
-        let config = config::config();
-        // Configure prepared statements cache.
-        self.prepared_statements.level = config.prepared_statements();
-        self.timeouts = Timeouts::from_config(&config.config.general);
-        self.query_log_stdout = config.config.general.query_log_stdout;
-        self.query_size_limit = config.config.general.query_size_limit;
-        self.stream_buffer
-            .set_size_limit_block(config.config.general.frontend_query_size_limit_block());
-
-        let mut has_set_time: bool = false;
         while !self.client_request.is_complete() {
             let idle_timeout = self
                 .timeouts
@@ -751,8 +756,7 @@ impl Client {
                 }
             };
 
-            if !has_set_time {
-                has_set_time = true;
+            if self.client_request.messages.is_empty() {
                 self.request_start = Instant::now();
                 self.statement_start.reset();
             }

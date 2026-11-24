@@ -19,11 +19,14 @@ pub(super) struct Recovery {
 
 impl Recovery {
     pub(super) fn new(mut server: Box<Server>, pool: Pool, cleanup: Cleanup) -> Self {
-        let needed = (server.in_transaction()
-            || cleanup.needed()
-            || server.sync_prepared()
-            || server.needs_drain())
-            && !server.is_force_close();
+        // Check-in always closes replication connections. Draining a WAL stream
+        // here would keep its sender alive until the recovery timeout.
+        let needed = !server.replication_mode()
+            && !server.is_force_close()
+            && (server.in_transaction()
+                || cleanup.needed()
+                || server.sync_prepared()
+                || server.needs_drain());
         server.reset_changed_params();
 
         Self {
@@ -204,8 +207,10 @@ mod test {
     use std::time::Duration;
 
     use pgdog_config::pooling::ConnectionRecovery;
+    use uuid::Uuid;
 
     use crate::backend::pool::{Address, Config, Pool, PoolConfig, Request};
+    use crate::backend::server::test::test_server;
     use crate::net::{Bind, Execute, Flush, Parse, Protocol, Query};
 
     const RECOVERY_MODES: [ConnectionRecovery; 3] = [
@@ -227,6 +232,55 @@ mod test {
         });
         pool.launch();
         pool
+    }
+
+    #[tokio::test]
+    async fn test_abandoned_wal_stream_skips_recovery() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = Pool::new(&PoolConfig {
+            address: Address::new_test(),
+            config: Config {
+                max: 1,
+                min: 0,
+                replication_mode: true,
+                connection_recovery: ConnectionRecovery::Recover,
+                ..Config::default()
+            },
+        });
+        pool.launch();
+        let name = format!("pgdog_recovery_{}", Uuid::new_v4().simple());
+        let mut primary = test_server().await;
+        primary
+            .execute_checked(format!("CREATE PUBLICATION {name}"))
+            .await?;
+
+        let mut guard = pool.get(&Request::default()).await?;
+        guard
+            .execute_checked(format!(
+                "CREATE_REPLICATION_SLOT {name} TEMPORARY LOGICAL pgoutput"
+            ))
+            .await?;
+        guard
+            .send(
+                &vec![
+                    Query::new(format!(
+                        "START_REPLICATION SLOT {name} LOGICAL 0/0 (proto_version '1', publication_names '{name}')"
+                    ))
+                    .into(),
+                ]
+                .into(),
+            )
+            .await?;
+        assert_eq!(guard.read().await?.code(), 'W');
+        assert!(guard.needs_drain());
+
+        drop(guard);
+        let checked_out = pool.state().checked_out;
+        primary
+            .execute_checked(format!("DROP PUBLICATION {name}"))
+            .await?;
+
+        assert_eq!(checked_out, 0, "a WAL stream must check in synchronously");
+        Ok(())
     }
 
     #[tokio::test]

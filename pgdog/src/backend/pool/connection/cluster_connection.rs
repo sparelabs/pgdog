@@ -28,9 +28,8 @@ pub(crate) struct ClusterConnection {
     // Cluster smart pointer.
     // Swapped at reload time, hence optional.
     cluster: Option<Cluster>,
-    // Cancelled when an admin terminates the cluster (`FORCE_RELOAD`).
+    // Retained across ordinary reloads and renewed only at a safe boundary.
     query_cancellation: CancellationToken,
-    reloads: usize,
     // Traffic mirrors.
     mirrors: Vec<MirrorHandler>,
 }
@@ -57,33 +56,31 @@ impl ClusterConnection {
         &mut self.mirrors
     }
 
-    /// Get cluster query cancellation token.
+    /// Get the frontend query cancellation token.
     pub(super) fn query_cancellation_token(&self) -> CancellationToken {
         self.query_cancellation.clone()
     }
 
-    pub(super) fn reloads(&self) -> usize {
-        self.reloads
-    }
-
     /// Perform an atomic and safe reload of the cluster config. This is needed
     /// because the global which holds the clusters is not atomically updated.
-    pub(super) async fn safe_reload(&mut self) -> Result<(), Error> {
+    pub(super) async fn safe_reload(&mut self, renew_token: bool) -> Result<(), Error> {
         if let Some(wait) = reload_notify::ready() {
             wait.await;
         }
 
-        self.reload()
+        self.reload(renew_token)
     }
 
     /// Reload connection state.
-    pub(super) fn reload(&mut self) -> Result<(), Error> {
+    pub(super) fn reload(&mut self, renew_token: bool) -> Result<(), Error> {
         self.init_passthrough_auth()?;
 
-        let cluster = databases::databases().cluster(self.identity())?;
+        let databases = databases::databases();
+        let cluster = databases.cluster(self.identity())?;
+        if renew_token || self.cluster.is_none() {
+            self.query_cancellation = databases.connection_token();
+        }
         self.cluster = Some(cluster);
-        self.query_cancellation = self.cluster()?.get_cancellation_token().child_token();
-        self.reloads += 1;
 
         self.init_mirrors()?;
 
@@ -158,7 +155,7 @@ impl ClusterConnection {
                         self.cluster()?.identifier()
                     );
 
-                    self.safe_reload().await?;
+                    self.safe_reload(false).await?;
                 }
                 Err(err) => return Err(err),
             }

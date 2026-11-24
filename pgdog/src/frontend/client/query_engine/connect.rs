@@ -39,15 +39,25 @@ impl QueryEngine {
         self.stats.waiting(request.created_at);
         self.comms.update_stats(self.stats);
 
+        let cancellation = self.cancellation_token();
+
         // If the pool hands out a connection right away, we reuse the start of the request.
         // We only read the clock if the checkout waited.
-        let (connect_result, connected_at) = {
+        let checkout = async {
             let mut connect = pin!(self.backend.connect(&request, connect_route));
 
             match poll!(connect.as_mut()) {
                 Poll::Ready(connect_result) => (connect_result, request.created_at),
                 Poll::Pending => (connect.await, Instant::now()),
             }
+        };
+        let (connect_result, connected_at) = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                self.backend.force_close();
+                return Err(Error::AdminTermination);
+            }
+            result = checkout => result,
         };
 
         let connected = match connect_result {
@@ -59,12 +69,19 @@ impl QueryEngine {
                 let query_timeout = context.timeouts.query_timeout(&self.stats.state);
 
                 // We may need to sync params with the server and that reads from the socket.
-                safe_timeout_from(
-                    connected_at,
-                    query_timeout,
-                    self.backend.link_client(context.id, context.params),
-                )
-                .await??;
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        // Parameter synchronization or BEGIN may be partly sent.
+                        self.backend.force_close();
+                        return Err(Error::AdminTermination);
+                    }
+                    result = safe_timeout_from(
+                        connected_at,
+                        query_timeout,
+                        self.backend.link_client(context.id, context.params),
+                    ) => { result??; }
+                }
 
                 true
             }

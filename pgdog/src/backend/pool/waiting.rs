@@ -5,7 +5,7 @@ use tokio::{sync::oneshot::*, time::Instant};
 
 pub(super) struct Waiting {
     pool: Pool,
-    rx: Option<Receiver<Result<Box<Server>, Error>>>,
+    rx: Receiver<Result<Box<Server>, Error>>,
     request: Request,
     waiting: bool,
 }
@@ -13,16 +13,20 @@ pub(super) struct Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         if self.waiting {
+            // An assignment can already be in the channel when checkout is
+            // cancelled. Keep it available for check-in after removing the
+            // waiter under the same lock the sender uses.
+            self.rx.close();
             self.pool.lock().remove_waiter(self.request.id);
+            if let Ok(Ok(server)) = self.rx.try_recv() {
+                drop(Guard::new(self.pool.clone(), server, Instant::now()));
+            }
         }
     }
 }
 
 impl Waiting {
     /// Create new waiter.
-    ///
-    /// N.B. You must call and await `Waiting::wait`, otherwise you'll leak waiters.
-    ///
     pub(super) fn new(pool: Pool, request: &Request) -> Result<Self, Error> {
         let request = *request;
         let (tx, rx) = channel();
@@ -50,7 +54,7 @@ impl Waiting {
 
         Ok(Self {
             pool,
-            rx: Some(rx),
+            rx,
             request,
             waiting: true,
         })
@@ -58,10 +62,8 @@ impl Waiting {
 
     /// Wait for connection from the pool.
     pub(super) async fn wait(&mut self) -> Result<(Guard, Instant), Error> {
-        let rx = self.rx.take().expect("waiter rx taken");
-
         // Can be cancelled. Drop will remove the waiter from the queue.
-        let server = rx.await;
+        let server = (&mut self.rx).await;
 
         // Disarm the guard. We can't be cancelled beyond this point.
         self.waiting = false;
@@ -96,6 +98,39 @@ mod tests {
     use crate::backend::pool::Pool;
     use crate::net::messages::FrontendPid;
     use tokio::time::{Duration, sleep, timeout};
+
+    #[tokio::test]
+    async fn test_cancellation_checks_in_an_assigned_server() {
+        use super::super::{Address, Config, PoolConfig};
+
+        let pool = Pool::new(&PoolConfig {
+            address: Address::new_test(),
+            config: Config {
+                max: 1,
+                min: 0,
+                ..Config::default()
+            },
+        });
+        pool.launch();
+        let holder = pool
+            .get(&Request::default())
+            .await
+            .expect("occupy the pool");
+        let request = Request::unrouted(FrontendPid::new());
+        let mut waiting = Waiting::new(pool.clone(), &request).expect("enqueue checkout");
+        let mut receive = Box::pin(waiting.wait());
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+        drop(holder);
+        assert_eq!(pool.state().checked_out, 1);
+        assert_eq!(pool.state().waiting, 0);
+
+        // Drop the awaiting receive future after assignment but before its next
+        // poll, as a higher-priority FORCE_RELOAD cancellation would.
+        drop(receive);
+        drop(waiting);
+        assert_eq!(pool.state().checked_out, 0);
+        assert_eq!(pool.state().idle, 1);
+    }
 
     #[tokio::test]
     async fn test_cancellation_safety() {

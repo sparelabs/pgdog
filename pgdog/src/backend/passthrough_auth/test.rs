@@ -50,8 +50,11 @@ fn setup(passthrough_auth: PassthroughAuth, users: Vec<User>) {
         ..Default::default()
     };
     let config = set(config).expect("set test config");
-    databases::replace_databases(databases::from_config(&config), false)
-        .expect("replace test databases");
+    databases::replace_databases(
+        databases::from_config(&config),
+        databases::PoolReplacement::Reconnect,
+    )
+    .expect("replace test databases");
 }
 
 fn user(password: Option<&str>) -> User {

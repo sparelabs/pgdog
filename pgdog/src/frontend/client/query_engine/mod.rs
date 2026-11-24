@@ -115,13 +115,26 @@ impl QueryEngine {
         Self::new(&client.params, &client.comms, client.admin)
     }
 
-    /// Token cancelled when an admin terminates this client's cluster (FORCE_RELOAD).
+    /// Token cancelled by an admin FORCE_RELOAD.
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.backend.cancellation_token()
     }
 
-    pub(crate) fn cluster_reloads(&self) -> usize {
-        self.backend.cluster_reloads()
+    pub(crate) fn can_rebind_after_force_reload(&self) -> bool {
+        self.backend.can_rebind_after_force_reload()
+    }
+
+    /// Keep frontends that own no transaction or server on a current route.
+    pub(crate) async fn rebind_after_force_reload(
+        &mut self,
+        in_transaction: bool,
+    ) -> Result<(), Error> {
+        if in_transaction || !self.can_rebind_after_force_reload() {
+            return Err(Error::AdminTermination);
+        }
+        self.backend.rebind_after_force_reload().await?;
+        self.router.reset();
+        Ok(())
     }
 
     /// Wait for an async message from the backend.
@@ -145,6 +158,10 @@ impl QueryEngine {
         context: &mut QueryEngineContext<'_>,
         client_request: &mut ClientRequest,
     ) -> Result<QueryEngineResult, Error> {
+        if self.cancellation_token().is_cancelled() {
+            return Err(Error::AdminTermination);
+        }
+
         if let Some(result) = Self::check_extended_pipeline_rewrite(client_request)? {
             return Ok(result);
         }

@@ -1,5 +1,7 @@
 use crate::admin::Command;
-use crate::backend::databases::{Databases, databases, from_config, replace_databases};
+use crate::backend::databases::{
+    Databases, PoolReplacement, databases, from_config, replace_databases,
+};
 use crate::backend::pool::cluster_metrics::Counts;
 use crate::config::{self, ConfigAndUsers, Database, Role, User as ConfigUser};
 use crate::net::messages::{DataRow, DataType, FromBytes, Protocol, RowDescription};
@@ -38,7 +40,7 @@ impl TestAdminContext {
         config::set(config.clone()).expect("failed to install test config");
 
         // Rebuild the in-process database registry from the supplied config.
-        replace_databases(from_config(&config), false).unwrap();
+        replace_databases(from_config(&config), PoolReplacement::Reconnect).unwrap();
     }
 }
 
@@ -52,7 +54,7 @@ impl Drop for TestAdminContext {
     fn drop(&mut self) {
         // Restore the original configuration and database registry so other tests remain isolated.
         let _ = config::set(self.original.config.clone());
-        replace_databases(self.original.databases.clone(), false).unwrap();
+        replace_databases(self.original.databases.clone(), PoolReplacement::Reconnect).unwrap();
     }
 }
 

@@ -417,3 +417,58 @@ async fn test_force_reload() {
         }
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn test_force_reload_terminates_transactions_from_retired_pools() {
+    let admin = admin_tokio().await;
+    let connections = connections_sqlx().await;
+    let pool = &connections[0];
+
+    let mut oldest = pool.begin().await.unwrap();
+    let oldest_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *oldest)
+        .await
+        .unwrap();
+
+    admin.simple_query("RELOAD").await.unwrap();
+
+    let newer_connections = connections_sqlx().await;
+    let mut newer = newer_connections[0].begin().await.unwrap();
+    let newer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *newer)
+        .await
+        .unwrap();
+    assert_ne!(newer_pid, oldest_pid);
+
+    admin.simple_query("RELOAD").await.unwrap();
+
+    for (transaction, expected_pid) in [(&mut oldest, oldest_pid), (&mut newer, newer_pid)] {
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **transaction)
+            .await
+            .unwrap();
+        assert_eq!(
+            pid, expected_pid,
+            "plain reload should preserve pinned transactions"
+        );
+    }
+
+    admin.simple_query("FORCE_RELOAD").await.unwrap();
+
+    for transaction in [&mut oldest, &mut newer] {
+        let error = sqlx::raw_sql("SELECT 1")
+            .execute(&mut **transaction)
+            .await
+            .unwrap_err();
+        assert_admin_termination(&error);
+    }
+
+    admin.simple_query("SHOW POOLS").await.unwrap();
+    let fresh_connections = connections_sqlx().await;
+    let value: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&fresh_connections[0])
+        .await
+        .unwrap();
+    assert_eq!(value, 1);
+}

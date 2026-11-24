@@ -132,8 +132,6 @@ impl Pool {
     /// Get a connection from the pool.
     async fn get_internal(&self, request: &Request) -> Result<Guard, Error> {
         loop {
-            let pool = self.clone();
-
             // Fast path, idle connection probably available.
             let (server, granted_at, paused) = {
                 // Ask for time before we acquire the lock
@@ -161,16 +159,17 @@ impl Pool {
                 (conn, granted_at, guard.paused)
             };
 
+            let server = server.map(|server| Guard::new(self.clone(), server, granted_at));
             if paused {
                 self.comms().ready.notified().await;
             }
 
             let (mut server, granted_at) = if let Some(server) = server {
-                (Guard::new(pool, server, granted_at), granted_at)
+                (server, granted_at)
             } else {
                 // Slow path, pool is empty, will create new connection
                 // or wait for one to be returned if the pool is maxed out.
-                let mut waiting = Waiting::new(pool, request)?;
+                let mut waiting = Waiting::new(self.clone(), request)?;
                 waiting.wait().await?
             };
 

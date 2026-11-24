@@ -18,6 +18,7 @@ use pgdog_config::{
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::backend::replication::ShardedSchemas;
@@ -58,8 +59,18 @@ pub(crate) fn databases() -> Arc<Databases> {
     DATABASES.load().clone()
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PoolReplacement {
+    Reconnect,
+    Reload,
+    ForceReload,
+}
+
 /// Replace databases pooler-wide.
-pub(crate) fn replace_databases(new_databases: Databases, reload: bool) -> Result<(), Error> {
+pub(crate) fn replace_databases(
+    mut new_databases: Databases,
+    replacement: PoolReplacement,
+) -> Result<(), Error> {
     // Order of operations is important
     // to ensure zero downtime for clients.
     //
@@ -69,14 +80,32 @@ pub(crate) fn replace_databases(new_databases: Databases, reload: bool) -> Resul
 
     // 2. Move connections from old databases into new ones.
     let old_databases = databases();
-    let new_databases = Arc::new(new_databases);
-    if reload {
-        // Move whatever connections we can over to new pools.
+    if matches!(
+        replacement,
+        PoolReplacement::Reload | PoolReplacement::ForceReload
+    ) {
         old_databases.move_conns_to(&new_databases)?;
     }
+
+    // Plain replacements share the token with retired pool sets. Frontends
+    // with backend work keep that token until the work ends.
+    let force = matches!(replacement, PoolReplacement::ForceReload);
+    if force {
+        old_databases.all().values().for_each(Cluster::set_offline);
+        new_databases.force_reload = CancellationToken::new();
+    } else {
+        new_databases.force_reload = old_databases.force_reload.clone();
+    }
+    let new_databases = Arc::new(new_databases);
+
     // 3. Launch new databases first.
     new_databases.launch();
     DATABASES.store(new_databases);
+    if force {
+        // Idle frontends rebind when they observe this cancellation. Publish
+        // the new generation first so they cannot rebind to retired pools.
+        old_databases.force_reload.cancel();
+    }
     // 4. Shutdown all databases.
     old_databases.shutdown();
 
@@ -90,7 +119,7 @@ pub(crate) fn reconnect() -> Result<(), Error> {
     let _guard = lock();
     let config = config();
     let databases = from_config(&config);
-    replace_databases(databases, false)?;
+    replace_databases(databases, PoolReplacement::Reconnect)?;
     Ok(())
 }
 
@@ -100,7 +129,7 @@ pub(crate) fn reload_from_existing() -> Result<(), Error> {
     let _lock = lock();
     let config = config();
     let databases = from_config(&config);
-    replace_databases(databases, true)?;
+    replace_databases(databases, PoolReplacement::Reload)?;
     super::passthrough_auth::check_db::reset();
 
     Ok(())
@@ -108,14 +137,14 @@ pub(crate) fn reload_from_existing() -> Result<(), Error> {
 
 pub(crate) fn reload_from_config(config: &ConfigAndUsers) -> Result<(), Error> {
     let databases = from_config(config);
-    replace_databases(databases, true)?;
+    replace_databases(databases, PoolReplacement::Reload)?;
     Ok(())
 }
 
 /// Initialize the databases for the first time.
 pub(crate) fn init() -> Result<(), Error> {
     let config = config();
-    replace_databases(from_config(&config), false)?;
+    replace_databases(from_config(&config), PoolReplacement::Reconnect)?;
 
     // Resize query cache
     Cache::resize(config.config.general.query_cache_limit);
@@ -156,14 +185,6 @@ pub(crate) async fn cancel_all(database: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Terminates all active connections on all `Pool`s.
-pub(crate) fn terminate_active_connections() {
-    databases()
-        .all()
-        .values()
-        .for_each(Cluster::terminate_active_connections);
-}
-
 /// Re-create pools from config.
 pub(crate) fn reload(force: bool) -> Result<(), Error> {
     let _guard = lock();
@@ -179,13 +200,12 @@ pub(crate) fn reload(force: bool) -> Result<(), Error> {
     let new_config = load(&old_config.config_path, &old_config.users_path)?;
     let databases = from_config(&new_config);
 
-    // Terminate after checking config for validity.
-    if force {
-        terminate_active_connections();
-    }
-
-    // Replace databases.
-    replace_databases(databases, true)?;
+    let replacement = if force {
+        PoolReplacement::ForceReload
+    } else {
+        PoolReplacement::Reload
+    };
+    replace_databases(databases, replacement)?;
 
     // Reload TLS connectors.
     tls::reload()?;
@@ -221,7 +241,7 @@ pub(crate) async fn cutover(source: &str, destination: &str) -> Result<ConfigAnd
         let config = crate::config::set(config)?;
         let databases = from_config(&config);
 
-        replace_databases(databases, true)?;
+        replace_databases(databases, PoolReplacement::Reload)?;
 
         config
     };
@@ -237,9 +257,14 @@ pub(crate) struct Databases {
     databases: HashMap<User, Cluster>,
     mirrors: HashMap<User, Vec<Cluster>>,
     mirror_configs: HashMap<(String, String), crate::config::MirrorConfig>,
+    force_reload: CancellationToken,
 }
 
 impl Databases {
+    pub(crate) fn connection_token(&self) -> CancellationToken {
+        self.force_reload.child_token()
+    }
+
     /// Get a configured auth type for this user, if the user exists.
     pub(crate) fn auth_type(&self, user: impl ToUser) -> Option<AuthType> {
         self.databases
@@ -681,6 +706,7 @@ pub(crate) fn from_config(config: &ConfigAndUsers) -> Databases {
         databases,
         mirrors,
         mirror_configs,
+        force_reload: CancellationToken::new(),
     }
 }
 

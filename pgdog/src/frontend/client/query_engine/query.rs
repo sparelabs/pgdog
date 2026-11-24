@@ -90,16 +90,9 @@ impl QueryEngine {
         let query_timeout = context.timeouts.query_timeout(&State::Active);
 
         let result = tokio::select! {
-            result = safe_timeout_from(
-                context.query_start,
-                query_timeout,
-                Box::pin(self.client_server_exchange(context, client_request, query_planner)),
-            ) => {
-                result
-            }
-            // If the cluster's cancellation token triggers, exit early. Currently used for admin FORCE_RELOAD.
-            // If this returns an Error, it'll be propagated up to Client's Box::pin(self.run())
-            // which will disconnect the client (and QueryEngine transactions)
+            biased;
+            // Observe FORCE_RELOAD before polling the exchange, which may
+            // send a request as soon as it runs.
             _ = cancellation_token.cancelled() => {
                 // Postgres is still running the query. Send a cancellation request before we stop on our end.
                 if let Err(err) = self.backend.cancel_query().await {
@@ -108,6 +101,13 @@ impl QueryEngine {
                 }
                 self.backend.force_close();
                 return Err(Error::AdminTermination);
+            }
+            result = safe_timeout_from(
+                context.query_start,
+                query_timeout,
+                Box::pin(self.client_server_exchange(context, client_request, query_planner)),
+            ) => {
+                result
             }
         };
 

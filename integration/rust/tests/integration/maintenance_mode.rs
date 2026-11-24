@@ -3,7 +3,8 @@ use std::time::Duration;
 use crate::setup::{admin_sqlx, admin_tokio, connection_failover, connections_sqlx};
 use serial_test::serial;
 use sqlx::Executor;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
+use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 #[tokio::test]
 #[serial]
@@ -240,4 +241,62 @@ async fn test_maintenance_mode_transaction_behavior() {
     for conn in conns {
         conn.close().await;
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_force_reload_preserves_unbound_maintenance_wait() {
+    let admin = admin_tokio().await;
+    let (client, connection) = tokio_postgres::connect(
+        "host=127.0.0.1 port=6432 user=pgdog password=pgdog dbname=pgdog application_name=force_reload_waiter",
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(connection);
+    client.simple_query("SELECT 1").await.unwrap();
+    admin.simple_query("RELOAD").await.unwrap();
+    admin.simple_query("MAINTENANCE ON").await.unwrap();
+
+    let mut query = tokio::spawn(async move { client.simple_query("SELECT 2").await });
+    let held = timeout(Duration::from_secs(5), async {
+        loop {
+            let clients = admin
+                .simple_query("SHOW CLIENTS state,application_name")
+                .await?;
+            if clients.iter().any(|message| {
+                matches!(message, SimpleQueryMessage::Row(row)
+                    if row.get("application_name") == Some("force_reload_waiter")
+                        && row.get("state") == Some("waiting"))
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        for _ in 0..2 {
+            admin.simple_query("FORCE_RELOAD").await?;
+        }
+        Ok::<_, tokio_postgres::Error>(
+            timeout(Duration::from_millis(100), &mut query)
+                .await
+                .is_err(),
+        )
+    })
+    .await;
+
+    // Always release the shared fixture.
+    admin.simple_query("MAINTENANCE OFF").await.unwrap();
+    assert!(
+        held.unwrap().unwrap(),
+        "the original frontend must stay held"
+    );
+    let result = timeout(Duration::from_secs(5), query)
+        .await
+        .expect("the queued query should resume")
+        .unwrap()
+        .unwrap();
+    assert!(result.iter().any(|message| {
+        matches!(message, SimpleQueryMessage::Row(row) if row.get(0) == Some("2"))
+    }));
 }

@@ -10,7 +10,12 @@ use tokio::{
 use bytes::{BufMut, BytesMut};
 
 use crate::{
-    backend::databases::databases,
+    backend::{
+        databases::{
+            PoolReplacement, databases, from_config, reload_from_existing, replace_databases,
+        },
+        pool::Request,
+    },
     config::{
         PreparedStatementsLevel, config, load_test, load_test_replicas, load_test_sharded,
         load_test_with_pooler_mode, set,
@@ -261,6 +266,123 @@ async fn test_abrupt_disconnect() {
     let (conn, mut client, _) = new_client!(false);
     drop(conn);
     client.run().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_force_reload_preserves_split_extended_request() {
+    let (mut conn, mut client, mut engine) = new_client!(false);
+    conn.write_all(&Parse::named("across_reload", "SELECT 42").to_bytes())
+        .await
+        .expect("send Parse");
+
+    // Interrupt the read after Parse, while the frontend is waiting for Sync.
+    assert!(
+        timeout(Duration::from_millis(100), client.buffer(State::Idle))
+            .await
+            .is_err()
+    );
+    assert_eq!(client.client_request.messages.len(), 1);
+    let request_start = client.request_start;
+
+    let retired = engine.cancellation_token();
+    replace_databases(from_config(&config()), PoolReplacement::ForceReload).expect("force reload");
+    assert!(retired.is_cancelled());
+    engine
+        .rebind_after_force_reload(client.in_transaction())
+        .await
+        .expect("rebind the unbound frontend");
+
+    conn.write_all(&buffer!(
+        { Bind::new_statement("across_reload") },
+        { Execute::new() },
+        { Sync }
+    ))
+    .await
+    .expect("finish the same request");
+    assert_eq!(
+        timeout(Duration::from_secs(2), client.buffer(State::Idle))
+            .await
+            .expect("buffered request")
+            .expect("complete protocol batch"),
+        BufferEvent::HaveRequest
+    );
+    assert_eq!(client.request_start, request_start);
+    timeout(Duration::from_secs(2), client.client_messages(&mut engine))
+        .await
+        .expect("execute the request")
+        .expect("named statement remains available");
+    let replies = timeout(
+        Duration::from_secs(2),
+        read_messages(&mut conn, &['1', '2', 'D', 'C', 'Z']),
+    )
+    .await
+    .expect("receive the complete extended response");
+    let row = DataRow::from_bytes(replies[2].to_bytes()).expect("data row");
+    assert_eq!(row.get_int(0, true), Some(42));
+    assert!(client.client_request.messages.is_empty());
+}
+
+#[tokio::test]
+async fn test_force_reload_interrupts_first_checkout_in_transaction() {
+    let (mut conn, mut client, _) = new_client!(false);
+    let mut old_config = (*config()).clone();
+    old_config.users.users[0].pool_size = Some(1);
+    old_config.users.users[0].min_pool_size = Some(0);
+    old_config.config.general.checkout_timeout = 10_000;
+    old_config.config.general.connect_timeout = 10_000;
+    set(old_config.clone()).expect("configure one available backend");
+    reload_from_existing().expect("install the original pool");
+
+    let cluster = databases()
+        .cluster(("pgdog", "pgdog"))
+        .expect("test cluster");
+    let old_pool = cluster.shards()[0].pools()[0].clone();
+    let _holder = old_pool
+        .get(&Request::default())
+        .await
+        .expect("occupy the pool");
+    let frontend = tokio::spawn(async move { client.spawn_internal().await });
+
+    conn.write_all(&Query::new("BEGIN").to_bytes())
+        .await
+        .expect("start a buffered transaction");
+    timeout(
+        Duration::from_secs(2),
+        read_messages(&mut conn, &['C', 'Z']),
+    )
+    .await
+    .expect("BEGIN responds without a backend");
+    conn.write_all(&Query::new("SELECT 1").to_bytes())
+        .await
+        .expect("request the first backend in the transaction");
+    timeout(Duration::from_secs(2), async {
+        while old_pool.state().waiting == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("query is waiting in the original pool");
+
+    // The replacement accepts TCP connections but sends no PostgreSQL reply.
+    let stalled_backend = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a backend without a protocol handler");
+    let mut replacement = old_config;
+    replacement.config.databases[0].port = stalled_backend
+        .local_addr()
+        .expect("replacement address")
+        .port();
+    set(replacement.clone()).expect("configure the replacement");
+    replace_databases(from_config(&replacement), PoolReplacement::ForceReload)
+        .expect("force reload while checkout is blocked");
+
+    let fatal = timeout(Duration::from_secs(2), async { read_one!(conn) })
+        .await
+        .expect("termination arrives before the checkout timeout");
+    let response = ErrorResponse::from_bytes(fatal.freeze()).expect("read termination");
+    assert_eq!(response.code, "57P01");
+    assert_eq!(old_pool.state().waiting, 0);
+    frontend.await.expect("frontend exits after cancellation");
 }
 
 #[tokio::test]
