@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use pgdog_config::{PoolerMode, QuerySizeLimitAction};
+use pgdog_config::{PoolerMode, QueryParserLevel, QuerySizeLimitAction};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -14,7 +14,9 @@ use crate::{
         databases::{
             PoolReplacement, databases, from_config, reload_from_existing, replace_databases,
         },
+        maintenance_mode,
         pool::Request,
+        server::test::test_server,
     },
     config::{
         PreparedStatementsLevel, config, load_test, load_test_replicas, load_test_sharded,
@@ -28,7 +30,7 @@ use crate::{
     net::{
         Bind, Close, CommandComplete, DataRow, Describe, ErrorResponse, Execute, Field, Flush,
         Format, FromBytes, Message, Parameters, Parse, ProtocolVersion, Query, ReadyForQuery,
-        RowDescription, Sync, Terminate, ToBytes,
+        RowDescription, Sync, Terminate, ToBytes, replication::StatusUpdate,
     },
     state::State,
 };
@@ -38,7 +40,7 @@ use super::Stream;
 pub(crate) mod auth;
 pub(crate) mod target_session_attrs;
 pub(crate) mod test_client;
-pub(crate) use test_client::{SpawnedClient, TestClient};
+pub(crate) use test_client::{SpawnedClient, TestClient, read_until};
 
 //
 // cargo nextest runs these in separate processes.
@@ -383,6 +385,103 @@ async fn test_force_reload_interrupts_first_checkout_in_transaction() {
     assert_eq!(response.code, "57P01");
     assert_eq!(old_pool.state().waiting, 0);
     frontend.await.expect("frontend exits after cancellation");
+}
+
+/// A replication client's standby status updates reach the server at once,
+/// even under maintenance mode. The server only advances the slot's
+/// `confirmed_flush_lsn` when it receives them.
+#[tokio::test]
+async fn test_maintenance_mode_forwards_replication_feedback() {
+    let (mut conn, mut client, _) = new_client!(false);
+    let mut replication = (*config()).clone();
+    replication.users.users[0].replication_mode = true;
+    replication.users.users[0].pooler_mode = Some(PoolerMode::Session);
+    replication.config.general.query_parser = QueryParserLevel::Off;
+    set(replication).expect("configure a replication login");
+    reload_from_existing().expect("install the replication pool");
+
+    let name = format!("pgdog_feedback_{}", uuid::Uuid::new_v4().simple());
+    let mut primary = test_server().await;
+    primary
+        .execute_checked(format!("CREATE PUBLICATION {name}"))
+        .await
+        .expect("create publication");
+    let frontend = tokio::spawn(async move { client.spawn_internal().await });
+
+    conn.write_all(
+        &Query::new(format!(
+            "CREATE_REPLICATION_SLOT {name} TEMPORARY LOGICAL pgoutput"
+        ))
+        .to_bytes(),
+    )
+    .await
+    .expect("create slot");
+    read_until(&mut conn, 'Z').await.expect("slot created");
+    conn.write_all(
+        &Query::new(format!(
+            "START_REPLICATION SLOT {name} LOGICAL 0/0 (proto_version '1', publication_names '{name}')"
+        ))
+        .to_bytes(),
+    )
+    .await
+    .expect("start replication");
+    read_until(&mut conn, 'W').await.expect("stream started");
+
+    maintenance_mode::start(None);
+
+    // WAL moves on, and the client confirms all of it.
+    primary
+        .execute_checked("SELECT pg_logical_emit_message(true, 'pgdog', 'held')")
+        .await
+        .expect("write WAL");
+    let target: u64 = primary
+        .fetch_all::<String>("SELECT (pg_current_wal_lsn() - '0/0')::bigint::text")
+        .await
+        .expect("current LSN")[0]
+        .parse()
+        .expect("LSN");
+    let feedback = StatusUpdate {
+        last_written: target,
+        last_flushed: target,
+        last_applied: target,
+        system_clock: 0,
+        reply: 0,
+    }
+    .wrapped()
+    .expect("status update");
+    conn.write_all(&feedback.to_bytes())
+        .await
+        .expect("send feedback");
+
+    let confirmed = timeout(Duration::from_secs(5), async {
+        loop {
+            let confirmed: u64 = primary
+                .fetch_all::<String>(format!(
+                    "SELECT (confirmed_flush_lsn - '0/0')::bigint::text FROM pg_replication_slots WHERE slot_name = '{name}'"
+                ))
+                .await
+                .expect("read slot")[0]
+                .parse()
+                .expect("LSN");
+            if confirmed >= target {
+                return confirmed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    maintenance_mode::stop(None);
+    drop(conn);
+    let _ = timeout(Duration::from_secs(5), frontend).await;
+    primary
+        .execute_checked(format!("DROP PUBLICATION {name}"))
+        .await
+        .expect("drop publication");
+
+    let confirmed =
+        confirmed.expect("the slot confirms the client's flush position under maintenance mode");
+    assert!(confirmed >= target);
 }
 
 #[tokio::test]

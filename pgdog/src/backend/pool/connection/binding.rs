@@ -388,6 +388,14 @@ impl Binding {
         }
     }
 
+    /// The bound server is streaming WAL to the client (CopyBoth).
+    pub(crate) fn streaming(&self) -> bool {
+        match self {
+            Binding::Direct(server) => server.streaming(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn in_copy_mode(&self) -> bool {
         match self {
             Binding::Admin(_) => false,
