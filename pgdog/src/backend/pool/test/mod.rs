@@ -76,6 +76,39 @@ async fn terminate_backend(pid: i32) {
     sleep(Duration::from_millis(100)).await;
 }
 
+/// A replication connection is closed when it's checked in, so a warm one
+/// can't serve a client: it would only hold a WAL sender open on the server.
+/// After FORCE_RELOAD, the replacement pool opened one and it stayed in
+/// `pg_stat_replication` with no client behind it.
+#[tokio::test]
+async fn test_replication_pool_keeps_no_idle_walsender() {
+    crate::logger();
+
+    let pool = Pool::new(&PoolConfig {
+        address: Address::new_test(),
+        config: Config {
+            max: 1,
+            min: 1,
+            replication_mode: true,
+            ..Config::default()
+        },
+    });
+    pool.launch();
+
+    let conn = pool.get(&Request::default()).await.unwrap();
+    assert!(conn.replication_mode());
+    drop(conn);
+
+    // Give the pool monitor time to replenish the pool, if it were going to.
+    sleep(Duration::from_millis(500)).await;
+    let state = pool.state();
+    assert_eq!(state.checked_out, 0);
+    assert_eq!(
+        state.total, 0,
+        "a replication pool must not keep an idle WAL sender"
+    );
+}
+
 #[tokio::test]
 async fn test_checkout_replaces_connection_closed_by_server() {
     crate::logger();
