@@ -173,7 +173,15 @@ impl Inner {
     }
 
     /// Minimum number of connections the pool should keep open.
+    ///
+    /// None in replication mode. Check-in closes a replication connection, so
+    /// a warm one can't serve a client: it would only hold a WAL sender open
+    /// on the server.
     pub(super) fn min(&self) -> usize {
+        if self.config.replication_mode {
+            return 0;
+        }
+
         RoleSpecificConfig {
             value: self.config.min,
             value_primary: self.config.min_primary,
@@ -731,6 +739,20 @@ mod test {
                 waiting: 0,
             }
         ));
+    }
+
+    #[test]
+    fn test_replication_mode_keeps_no_minimum() {
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
+        inner.config.min = 2;
+        inner.config.max = 5;
+        inner.config.replication_mode = true;
+
+        assert_eq!(inner.min(), 0);
+        assert!(matches!(inner.should_create(), ShouldCreate::No));
     }
 
     #[test]

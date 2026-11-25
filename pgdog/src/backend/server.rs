@@ -125,6 +125,10 @@ impl From<&Vec<Query>> for ServerRequest {
     }
 }
 
+/// How long to look for the server's FATAL after a write to it failed.
+/// The server sent it before closing, so it is already in our socket buffer.
+const CLOSED_BY_SERVER_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// PostgreSQL server connection.
 #[derive(Debug)]
 pub(crate) struct Server {
@@ -512,10 +516,16 @@ impl Server {
         self.prepared_statements
             .set_anonymous_client_params(client_request.anonymous_client_params);
 
-        for message in client_request.messages.iter() {
-            self.send_one(message).await?;
+        let sent = async {
+            for message in client_request.messages.iter() {
+                self.send_one(message).await?;
+            }
+            self.flush().await
         }
-        self.flush().await?;
+        .await;
+        if let Err(err) = sent {
+            return Err(self.closed_by_server(err).await);
+        }
 
         // The whole request is now in server's hands.
         // We can recover the connection from this point on.
@@ -524,6 +534,45 @@ impl Server {
         self.stats.state(State::ReceivingData);
 
         Ok(())
+    }
+
+    /// Find out why a write to the server failed.
+    ///
+    /// Postgres sends a FATAL ErrorResponse before it closes a connection, e.g.
+    /// on `pg_terminate_backend()`. A write that races the close fails with
+    /// `EPIPE` or `ECONNRESET`, and that I/O error would hide the server's reason
+    /// from the client. A replication client sends standby status updates on
+    /// its own schedule, so it hits this often. Read what the server sent before
+    /// it closed, and return its FATAL instead.
+    async fn closed_by_server(&mut self, err: Error) -> Error {
+        if !matches!(err, Error::Io(_) | Error::Net(crate::net::Error::Io(_))) {
+            return err;
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return err;
+        };
+        let stream_buffer = &mut self.stream_buffer;
+        let fatal = timeout(CLOSED_BY_SERVER_READ_TIMEOUT, async {
+            loop {
+                let message = stream_buffer.read(stream).await.ok()?;
+                if message.code() != 'E' {
+                    continue;
+                }
+                let error = ErrorResponse::from_bytes(message.to_bytes()).ok()?;
+                if matches!(error.severity.as_str(), "FATAL" | "PANIC") {
+                    return Some(error);
+                }
+            }
+        })
+        .await;
+
+        match fatal {
+            Ok(Some(error)) => {
+                self.stats.state(State::ForceClose);
+                Error::ExecutionError(Box::new(error))
+            }
+            _ => err,
+        }
     }
 
     /// Send one message to the server but don't flush the buffer,
@@ -875,6 +924,11 @@ impl Server {
 
     pub(crate) fn in_copy_mode(&self) -> bool {
         self.prepared_statements.in_copy_mode()
+    }
+
+    /// Server is streaming WAL to the client (CopyBoth).
+    pub(crate) fn streaming(&self) -> bool {
+        self.streaming
     }
 
     /// Protocol is out of sync due to an error in extended protocol.
@@ -4608,5 +4662,94 @@ pub(crate) mod test {
             // Must never go below zero (Duration is unsigned anyway,
             // but saturation must not panic).
         }
+    }
+
+    #[tokio::test]
+    async fn test_terminated_walsender_fatal_survives_a_failed_write() {
+        use crate::net::messages::replication::StatusUpdate;
+
+        let name = format!("pgdog_terminated_{}", ::uuid::Uuid::new_v4().simple());
+        let mut primary = test_server().await;
+        primary
+            .execute_checked(format!("CREATE PUBLICATION {name}"))
+            .await
+            .unwrap();
+
+        let mut server = test_replication_server().await;
+        server
+            .execute_checked(format!(
+                "CREATE_REPLICATION_SLOT {name} TEMPORARY LOGICAL pgoutput"
+            ))
+            .await
+            .unwrap();
+        server
+            .send(
+                &vec![ProtocolMessage::from(Query::new(format!(
+                    "START_REPLICATION SLOT {name} LOGICAL 0/0 (proto_version '1', publication_names '{name}')"
+                )))]
+                .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(server.read().await.unwrap().code(), 'W');
+
+        // The server ends the walsender while PgDog is not reading from it.
+        let terminated = primary
+            .fetch_all::<String>(format!(
+                "SELECT pg_terminate_backend(active_pid)::text FROM pg_replication_slots WHERE slot_name = '{name}'"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(terminated, vec!["true".to_string()]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !primary
+                .fetch_all::<String>(format!(
+                    "SELECT (active_pid IS NULL)::text FROM pg_replication_slots WHERE slot_name = '{name}'"
+                ))
+                .await
+                .unwrap()
+                .iter()
+                .all(|gone| gone == "true")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("walsender exits");
+
+        // The client's standby status updates keep coming. Writing them to the
+        // closed socket fails; the client must still see the server's reason.
+        let feedback = StatusUpdate {
+            last_written: 0,
+            last_flushed: 0,
+            last_applied: 0,
+            system_clock: 0,
+            reply: 0,
+        }
+        .wrapped()
+        .unwrap();
+        let mut result = Ok(());
+        for _ in 0..10 {
+            result = server
+                .send(&vec![ProtocolMessage::from(feedback.clone())].into())
+                .await;
+            if result.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        primary
+            .execute_checked(format!("DROP PUBLICATION {name}"))
+            .await
+            .unwrap();
+
+        match result {
+            Err(Error::ExecutionError(error)) => {
+                assert_eq!(error.severity, "FATAL");
+                assert_eq!(error.code, "57P01");
+            }
+            other => panic!("expected the server's FATAL 57P01, got {other:?}"),
+        }
+        assert_eq!(server.stats().get_state(), State::ForceClose);
     }
 }

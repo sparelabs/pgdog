@@ -120,6 +120,11 @@ impl QueryEngine {
         self.backend.cancellation_token()
     }
 
+    /// The client holds a replication stream (CopyBoth) open on its server.
+    pub(crate) fn streaming_replication(&self) -> bool {
+        self.backend.streaming()
+    }
+
     pub(crate) fn can_rebind_after_force_reload(&self) -> bool {
         self.backend.can_rebind_after_force_reload()
     }

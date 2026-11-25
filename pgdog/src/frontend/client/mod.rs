@@ -577,6 +577,9 @@ impl Client {
             }
 
             let client_state = query_engine.client_state();
+            // CopyData from a replication client is a stream: forward each
+            // message as it arrives instead of buffering it.
+            self.streaming = query_engine.streaming_replication();
             let admin_termination = query_engine.cancellation_token().cancelled_owned();
 
             select! {
@@ -598,8 +601,7 @@ impl Client {
                     let event = buffer?;
 
                     // Only send requests to the backend if they are complete.
-                    if self.client_request.is_complete()
-                        && !self.client_request.messages.is_empty() {
+                    if self.request_ready() {
                             self.client_messages(&mut query_engine).await?;
                         }
 
@@ -634,7 +636,10 @@ impl Client {
     /// Suspend client execution if the pooler is set in maintenance mode.
     ///
     /// This can happen only between transactions. The admin client ignores maintenance
-    /// mode because it can be used to turn it off.
+    /// mode because it can be used to turn it off. A replication stream that is
+    /// already open isn't held either: its CopyData carries the client's standby
+    /// status updates, and the server only advances the slot when it gets them.
+    /// The stream ends when the server ends it, or on `FORCE_RELOAD`.
     ///
     /// # Arguments
     ///
@@ -643,6 +648,7 @@ impl Client {
     async fn check_maintenance_mode(&self, query_engine: &mut QueryEngine) -> Result<(), Error> {
         if !self.in_transaction()
             && !self.admin
+            && !query_engine.streaming_replication()
             && let Some(waiter) = maintenance_mode::waiter(&self.database)
         {
             let cancellation = query_engine.cancellation_token();
@@ -713,6 +719,15 @@ impl Client {
         Ok(())
     }
 
+    /// The buffered request can go to the server.
+    ///
+    /// While a replication stream is open, every CopyData is a request on its
+    /// own: it can carry a standby status update the server is waiting for.
+    fn request_ready(&self) -> bool {
+        !self.client_request.messages.is_empty()
+            && (self.streaming || self.client_request.is_complete())
+    }
+
     /// Buffer extended protocol messages until client requests a sync.
     ///
     /// This ensures we don't check out a connection from the pool until the client
@@ -730,7 +745,7 @@ impl Client {
                 .set_size_limit_block(config.config.general.frontend_query_size_limit_block());
         }
 
-        while !self.client_request.is_complete() {
+        while !self.request_ready() {
             let idle_timeout = self
                 .timeouts
                 .client_idle_timeout(&state, &self.client_request);
